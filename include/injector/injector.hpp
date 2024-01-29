@@ -457,6 +457,22 @@ inline memory_pointer_raw ReadRelativeOffset(memory_pointer_tr at, size_t sizeof
 }
 
 /*
+ *  ReadRelativeAddress
+ *      Reads relative address from address @at
+ */
+inline injector::memory_pointer_raw ReadRelativeAddress(memory_pointer_tr at, size_t sizeof_addr = 4, bool vp = true)
+{
+    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    switch (sizeof_addr)
+    {
+        case 1: return (base + ReadMemory<int8_t>(at, vp));
+        case 2: return (base + ReadMemory<int16_t>(at, vp));
+        case 4: return (base + ReadMemory<int32_t>(at, vp));
+    }
+    return nullptr;
+}
+
+/*
  *  MakeRelativeOffset
  *      Writes relative offset into @at based on absolute destination @dest
  */
@@ -520,6 +536,29 @@ inline memory_pointer_raw MakeCALL(memory_pointer_tr at, memory_pointer_raw dest
     WriteMemory<uint8_t>(at, 0xE8, vp);
     MakeRelativeOffset(at+1, dest, 4, vp);
     return p;
+}
+
+/*
+ *  MakeAbsCALL64
+ *      Creates a 16 bytes CALL instruction at address @at that jumps into address @dest
+ */
+inline void MakeAbsCALL64(injector::memory_pointer_tr at, injector::memory_pointer_raw dest, bool vp = true)
+{
+    injector::WriteMemory<uint16_t>(at, 0x15FF, vp);
+    injector::WriteMemory<uint32_t>(at + sizeof(uint16_t), 2, vp);
+    injector::WriteMemory<uint16_t>(at + sizeof(uint16_t) + sizeof(uint32_t), 0x08EB, vp);
+    injector::WriteMemory<uint64_t>(at + sizeof(uint16_t) + sizeof(uint32_t) + sizeof(uint16_t), dest.as_int(), vp);
+}
+
+/*
+ *  MakeAbsJMP64
+ *      Creates a 14 bytes JMP instruction at address @at that jumps into address @dest
+ */
+inline void MakeAbsJMP64(injector::memory_pointer_tr at, injector::memory_pointer_raw dest, bool vp = true)
+{
+    injector::WriteMemory<uint16_t>(at, 0x25FF, vp);
+    injector::WriteMemory<uint32_t>(at + sizeof(uint16_t), 0, vp);
+    injector::WriteMemory<uint64_t>(at + sizeof(uint16_t) + sizeof(uint32_t), dest.as_int(), vp);
 }
 
 /*
