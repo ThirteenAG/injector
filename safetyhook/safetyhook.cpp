@@ -663,7 +663,7 @@ std::expected<void, InlineHook::Error> InlineHook::e9_hook(const std::shared_ptr
                 error = result.error();
             }
         },
-        [this](uint32_t, HANDLE, CONTEXT& ctx) {
+        [this](auto, auto, auto ctx) {
             for (size_t i = 0; i < m_original_bytes.size(); ++i) {
                 fix_ip(ctx, m_target + i, m_trampoline.data() + i);
             }
@@ -730,7 +730,7 @@ std::expected<void, InlineHook::Error> InlineHook::ff_hook(const std::shared_ptr
                 error = result.error();
             }
         },
-        [this](uint32_t, HANDLE, CONTEXT& ctx) {
+        [this](auto, auto, auto ctx) {
             for (size_t i = 0; i < m_original_bytes.size(); ++i) {
                 fix_ip(ctx, m_target + i, m_trampoline.data() + i);
             }
@@ -757,7 +757,7 @@ void InlineHook::destroy() {
                 std::copy(m_original_bytes.begin(), m_original_bytes.end(), m_target);
             }
         },
-        [this](uint32_t, HANDLE, CONTEXT& ctx) {
+        [this](auto, auto, auto ctx) {
             for (size_t i = 0; i < m_original_bytes.size(); ++i) {
                 fix_ip(ctx, m_trampoline.data() + i, m_target + i);
             }
@@ -852,9 +852,9 @@ void MidHook::reset() {
 }
 
 std::expected<void, MidHook::Error> MidHook::setup(
-    const std::shared_ptr<Allocator>& allocator, uint8_t* target, MidHookFn destination) {
+    const std::shared_ptr<Allocator>& allocator, uint8_t* target, MidHookFn destination_fn) {
     m_target = target;
-    m_destination = destination;
+    m_destination = destination_fn;
 
     auto stub_allocation = allocator->allocate(asm_data.size());
 
@@ -920,7 +920,7 @@ NtGetNextThread(HANDLE ProcessHandle, HANDLE ThreadHandle, ACCESS_MASK DesiredAc
 
 namespace safetyhook {
 void execute_while_frozen(
-    const std::function<void()>& run_fn, const std::function<void(uint32_t, HANDLE, CONTEXT&)>& visit_fn) {
+    const std::function<void()>& run_fn, const std::function<void(ThreadId, ThreadHandle, ThreadContext)>& visit_fn) {
     // Freeze all threads.
     int num_threads_frozen;
     auto first_run = true;
@@ -973,7 +973,8 @@ void execute_while_frozen(
             }
 
             if (visit_fn) {
-                visit_fn(thread_id, thread, thread_ctx);
+                visit_fn(static_cast<ThreadId>(thread_id), static_cast<ThreadHandle>(thread),
+                    static_cast<ThreadContext>(&thread_ctx));
             }
 
             ++num_threads_frozen;
@@ -1016,11 +1017,13 @@ void execute_while_frozen(
     }
 }
 
-void fix_ip(CONTEXT& ctx, uint8_t* old_ip, uint8_t* new_ip) {
+void fix_ip(ThreadContext thread_ctx, uint8_t* old_ip, uint8_t* new_ip) {
+    auto* ctx = reinterpret_cast<CONTEXT*>(thread_ctx);
+
 #ifdef _M_X64
-    auto ip = ctx.Rip;
+    auto ip = ctx->Rip;
 #else
-    auto ip = ctx.Eip;
+    auto ip = ctx->Eip;
 #endif
 
     if (ip == reinterpret_cast<uintptr_t>(old_ip)) {
@@ -1028,9 +1031,9 @@ void fix_ip(CONTEXT& ctx, uint8_t* old_ip, uint8_t* new_ip) {
     }
 
 #ifdef _M_X64
-    ctx.Rip = ip;
+    ctx->Rip = ip;
 #else
-    ctx.Eip = ip;
+    ctx->Eip = ip;
 #endif
 }
 } // namespace safetyhook
