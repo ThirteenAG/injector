@@ -180,6 +180,55 @@ private:
 } // namespace safetyhook
 
 //
+// Header: safetyhook/common.hpp
+//
+// Include stack:
+//   - safetyhook.hpp
+//   - safetyhook/easy.hpp
+//   - safetyhook/inline_hook.hpp
+//
+
+#pragma once
+
+#if defined(_MSC_VER)
+#define SAFETYHOOK_COMPILER_MSVC 1
+#define SAFETYHOOK_COMPILER_GCC 0
+#define SAFETYHOOK_COMPILER_CLANG 0
+#elif defined(__GNUC__)
+#define SAFETYHOOK_COMPILER_MSVC 0
+#define SAFETYHOOK_COMPILER_GCC 1
+#define SAFETYHOOK_COMPILER_CLANG 0
+#elif defined(__clang__)
+#define SAFETYHOOK_COMPILER_MSVC 0
+#define SAFETYHOOK_COMPILER_GCC 0
+#define SAFETYHOOK_COMPILER_CLANG 1
+#else
+#error "Unsupported compiler"
+#endif
+
+#if SAFETYHOOK_COMPILER_MSVC
+#if defined(_M_IX86)
+#define SAFETYHOOK_ARCH_X86_32 1
+#define SAFETYHOOK_ARCH_X86_64 0
+#elif defined(_M_X64)
+#define SAFETYHOOK_ARCH_X86_32 0
+#define SAFETYHOOK_ARCH_X86_64 1
+#else
+#error "Unsupported architecture"
+#endif
+#elif SAFETYHOOK_COMPILER_GCC || SAFETYHOOK_COMPILER_CLANG
+#if defined(__i386__)
+#define SAFETYHOOK_ARCH_X86_32 1
+#define SAFETYHOOK_ARCH_X86_64 0
+#elif defined(__x86_64__)
+#define SAFETYHOOK_ARCH_X86_32 0
+#define SAFETYHOOK_ARCH_X86_64 1
+#else
+#error "Unsupported architecture"
+#endif
+#endif
+
+//
 // Header: safetyhook/utility.hpp
 //
 // Include stack:
@@ -225,6 +274,19 @@ private:
 };
 
 [[nodiscard]] std::optional<UnprotectMemory> unprotect(uint8_t* address, size_t size);
+
+template <typename T> constexpr T align_up(T address, size_t align) {
+    const auto unaligned_address = (uintptr_t)address;
+    const auto aligned_address = (unaligned_address + align - 1) & ~(align - 1);
+    return (T)aligned_address;
+}
+
+template <typename T> constexpr T align_down(T address, size_t align) {
+    const auto unaligned_address = (uintptr_t)address;
+    const auto aligned_address = unaligned_address & ~(align - 1);
+    return (T)aligned_address;
+}
+
 } // namespace safetyhook
 
 namespace safetyhook {
@@ -508,7 +570,7 @@ private:
         const std::shared_ptr<Allocator>& allocator, uint8_t* target, uint8_t* destination);
     std::expected<void, Error> e9_hook(const std::shared_ptr<Allocator>& allocator);
 
-#ifdef _M_X64
+#if SAFETYHOOK_ARCH_X86_64
     std::expected<void, Error> ff_hook(const std::shared_ptr<Allocator>& allocator);
 #endif
 
@@ -549,6 +611,7 @@ private:
 
 #include <cstdint>
 
+
 namespace safetyhook {
 union Xmm {
     uint8_t u8[16];
@@ -586,9 +649,9 @@ struct Context32 {
 /// to the registers at the moment the hook is called.
 /// @note The structure is different depending on architecture.
 /// @note The structure only provides access to integer registers.
-#ifdef _M_X64
+#if SAFETYHOOK_ARCH_X86_64
 using Context = Context64;
-#else
+#elif SAFETYHOOK_ARCH_X86_32
 using Context = Context32;
 #endif
 
@@ -951,15 +1014,7 @@ using ThreadId = uint32_t;
 using ThreadHandle = void*;
 using ThreadContext = void*;
 
-/// @brief Executes a function while all other threads are frozen. Also allows for visiting each frozen thread and
-/// modifying it's context.
-/// @param run_fn The function to run while all other threads are frozen.
-/// @param visit_fn The function that will be called for each frozen thread.
-/// @note The visit function will be called in the order that the threads were frozen.
-/// @note The visit function will be called before the run function.
-/// @note Keep the logic inside run_fn and visit_fn as simple as possible to avoid deadlocks.
-void execute_while_frozen(const std::function<void()>& run_fn,
-    const std::function<void(ThreadId, ThreadHandle, ThreadContext)>& visit_fn = {});
+void trap_threads(uint8_t* from, uint8_t* to, size_t len, const std::function<void()>& run_fn);
 
 /// @brief Will modify the context of a thread's IP to point to a new address if its IP is at the old address.
 /// @param ctx The thread context to modify.
