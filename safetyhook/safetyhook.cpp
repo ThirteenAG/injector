@@ -13,14 +13,87 @@
 #include <functional>
 #include <limits>
 
-#define NOMINMAX
-#if __has_include(<Windows.h>)
-#include <Windows.h>
-#elif __has_include(<windows.h>)
-#include <windows.h>
+
+//
+// Header: safetyhook/os.hpp
+//
+
+// This is the OS abstraction layer.
+#pragma once
+
+#ifndef SAFETYHOOK_USE_CXXMODULES
+#include <cstdint>
+#include <expected>
+#include <functional>
 #else
-#error "Windows.h not found"
+import std.compat;
 #endif
+
+namespace safetyhook {
+
+enum class OsError {
+    FAILED_TO_ALLOCATE,
+    FAILED_TO_PROTECT,
+    FAILED_TO_QUERY,
+    FAILED_TO_GET_NEXT_THREAD,
+    FAILED_TO_GET_THREAD_CONTEXT,
+    FAILED_TO_SET_THREAD_CONTEXT,
+    FAILED_TO_FREEZE_THREAD,
+    FAILED_TO_UNFREEZE_THREAD,
+    FAILED_TO_GET_THREAD_ID,
+};
+
+struct VmAccess {
+    bool read : 1;
+    bool write : 1;
+    bool execute : 1;
+
+    constexpr bool operator==(const VmAccess& other) const {
+        return read == other.read && write == other.write && execute == other.execute;
+    }
+};
+
+constexpr VmAccess VM_ACCESS_R{.read = true, .write = false, .execute = false};
+constexpr VmAccess VM_ACCESS_RW{.read = true, .write = true, .execute = false};
+constexpr VmAccess VM_ACCESS_RX{.read = true, .write = false, .execute = true};
+constexpr VmAccess VM_ACCESS_RWX{.read = true, .write = true, .execute = true};
+
+struct VmBasicInfo {
+    uint8_t* address;
+    size_t size;
+    VmAccess access;
+    bool is_free;
+};
+
+std::expected<uint8_t*, OsError> vm_allocate(uint8_t* address, size_t size, VmAccess access);
+void vm_free(uint8_t* address);
+std::expected<uint32_t, OsError> vm_protect(uint8_t* address, size_t size, VmAccess access);
+std::expected<uint32_t, OsError> vm_protect(uint8_t* address, size_t size, uint32_t access);
+std::expected<VmBasicInfo, OsError> vm_query(uint8_t* address);
+bool vm_is_readable(uint8_t* address, size_t size);
+bool vm_is_writable(uint8_t* address, size_t size);
+bool vm_is_executable(uint8_t* address);
+
+struct SystemInfo {
+    uint32_t page_size;
+    uint32_t allocation_granularity;
+    uint8_t* min_address;
+    uint8_t* max_address;
+};
+
+SystemInfo system_info();
+
+using ThreadContext = void*;
+
+void trap_threads(uint8_t* from, uint8_t* to, size_t len, const std::function<void()>& run_fn);
+
+/// @brief Will modify the context of a thread's IP to point to a new address if its IP is at the old address.
+/// @param ctx The thread context to modify.
+/// @param old_ip The old IP address.
+/// @param new_ip The new IP address.
+void fix_ip(ThreadContext ctx, uint8_t* old_ip, uint8_t* new_ip);
+
+} // namespace safetyhook
 
 
 
@@ -126,18 +199,14 @@ std::expected<Allocation, Allocator::Error> Allocator::internal_allocate_near(
     }
 
     // If we didn't find a free block, we need to allocate a new one.
-    SYSTEM_INFO si{};
-
-    GetSystemInfo(&si);
-
-    const auto allocation_size = align_up(size, si.dwAllocationGranularity);
-    const auto allocation_address = allocate_nearby_memory(desired_addresses, allocation_size, max_distance);
+    auto allocation_size = align_up(size, system_info().allocation_granularity);
+    auto allocation_address = allocate_nearby_memory(desired_addresses, allocation_size, max_distance);
 
     if (!allocation_address) {
         return std::unexpected{allocation_address.error()};
     }
 
-    const auto& allocation = m_memory.emplace_back(new Memory);
+    auto& allocation = m_memory.emplace_back(new Memory);
 
     allocation->address = *allocation_address;
     allocation->size = allocation_size;
@@ -198,9 +267,8 @@ void Allocator::combine_adjacent_freenodes(Memory& memory) {
 std::expected<uint8_t*, Allocator::Error> Allocator::allocate_nearby_memory(
     const std::vector<uint8_t*>& desired_addresses, size_t size, size_t max_distance) {
     if (desired_addresses.empty()) {
-        if (const auto result = VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-            result != nullptr) {
-            return static_cast<uint8_t*>(result);
+        if (auto result = vm_allocate(nullptr, size, VM_ACCESS_RWX)) {
+            return result.value();
         }
 
         return std::unexpected{Error::BAD_VIRTUAL_ALLOC};
@@ -211,16 +279,17 @@ std::expected<uint8_t*, Allocator::Error> Allocator::allocate_nearby_memory(
             return nullptr;
         }
 
-        return static_cast<uint8_t*>(VirtualAlloc(p, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (auto result = vm_allocate(p, size, VM_ACCESS_RWX)) {
+            return result.value();
+        }
+
+        return nullptr;
     };
 
-    SYSTEM_INFO si{};
-
-    GetSystemInfo(&si);
-
+    auto si = system_info();
     auto desired_address = desired_addresses[0];
-    auto search_start = reinterpret_cast<uint8_t*>(std::numeric_limits<uintptr_t>::min());
-    auto search_end = reinterpret_cast<uint8_t*>(std::numeric_limits<uintptr_t>::max());
+    auto search_start = si.min_address;
+    auto search_end = si.max_address;
 
     if (static_cast<size_t>(desired_address - search_start) > max_distance) {
         search_start = desired_address - max_distance;
@@ -230,35 +299,42 @@ std::expected<uint8_t*, Allocator::Error> Allocator::allocate_nearby_memory(
         search_end = desired_address + max_distance;
     }
 
-    search_start = std::max(search_start, static_cast<uint8_t*>(si.lpMinimumApplicationAddress));
-    search_end = std::min(search_end, static_cast<uint8_t*>(si.lpMaximumApplicationAddress));
-    desired_address = align_up(desired_address, si.dwAllocationGranularity);
-    MEMORY_BASIC_INFORMATION mbi{};
+    search_start = std::max(search_start, si.min_address);
+    search_end = std::min(search_end, si.max_address);
+    desired_address = align_up(desired_address, si.allocation_granularity);
+    VmBasicInfo mbi{};
 
     // Search backwards from the desired_address.
     for (auto p = desired_address; p > search_start && in_range(p, desired_addresses, max_distance);
-         p = align_down(static_cast<uint8_t*>(mbi.AllocationBase) - 1, si.dwAllocationGranularity)) {
-        if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) {
+         p = align_down(mbi.address - 1, si.allocation_granularity)) {
+        auto result = vm_query(p);
+
+        if (!result) {
             break;
         }
 
-        if (mbi.State != MEM_FREE) {
+        mbi = result.value();
+
+        if (!mbi.is_free) {
             continue;
         }
 
-        if (auto allocation_address = attempt_allocation(p); allocation_address != 0) {
+        if (auto allocation_address = attempt_allocation(p); allocation_address != nullptr) {
             return allocation_address;
         }
     }
 
     // Search forwards from the desired_address.
-    for (auto p = desired_address; p < search_end && in_range(p, desired_addresses, max_distance);
-         p += mbi.RegionSize) {
-        if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) {
+    for (auto p = desired_address; p < search_end && in_range(p, desired_addresses, max_distance); p += mbi.size) {
+        auto result = vm_query(p);
+
+        if (!result) {
             break;
         }
 
-        if (mbi.State != MEM_FREE) {
+        mbi = result.value();
+
+        if (!mbi.is_free) {
             continue;
         }
 
@@ -278,7 +354,7 @@ bool Allocator::in_range(uint8_t* address, const std::vector<uint8_t*>& desired_
 }
 
 Allocator::Memory::~Memory() {
-    VirtualFree(address, 0, MEM_RELEASE);
+    vm_free(address);
 }
 } // namespace safetyhook
 
@@ -318,14 +394,6 @@ VmtHook create_vmt(void* object) {
 //
 
 #include <iterator>
-
-#if __has_include(<Windows.h>)
-#include <Windows.h>
-#elif __has_include(<windows.h>)
-#include <windows.h>
-#else
-#error "Windows.h not found"
-#endif
 
 #if __has_include("Zydis/Zydis.h")
 #include "Zydis/Zydis.h"
@@ -733,6 +801,7 @@ void InlineHook::destroy() {
 namespace safetyhook {
 
 #if SAFETYHOOK_ARCH_X86_64
+#if SAFETYHOOK_OS_WINDOWS
 constexpr std::array<uint8_t, 391> asm_data = {0xFF, 0x35, 0x79, 0x01, 0x00, 0x00, 0x54, 0x54, 0x55, 0x50, 0x53, 0x51,
     0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
     0x9C, 0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x7F, 0xBC, 0x24, 0xF0, 0x00, 0x00, 0x00, 0xF3,
@@ -754,6 +823,29 @@ constexpr std::array<uint8_t, 391> asm_data = {0xFF, 0x35, 0x79, 0x01, 0x00, 0x0
     0x00, 0x00, 0x48, 0x81, 0xC4, 0x00, 0x01, 0x00, 0x00, 0x9D, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x41,
     0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58, 0x5D, 0x48, 0x8D, 0x64, 0x24, 0x08,
     0x5C, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+#elif SAFETYHOOK_OS_LINUX
+constexpr std::array<uint8_t, 391> asm_data = {0xFF, 0x35, 0x79, 0x01, 0x00, 0x00, 0x54, 0x54, 0x55, 0x50, 0x53, 0x51,
+    0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+    0x9C, 0x48, 0x81, 0xEC, 0x00, 0x01, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x7F, 0xBC, 0x24, 0xF0, 0x00, 0x00, 0x00, 0xF3,
+    0x44, 0x0F, 0x7F, 0xB4, 0x24, 0xE0, 0x00, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x7F, 0xAC, 0x24, 0xD0, 0x00, 0x00, 0x00,
+    0xF3, 0x44, 0x0F, 0x7F, 0xA4, 0x24, 0xC0, 0x00, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x7F, 0x9C, 0x24, 0xB0, 0x00, 0x00,
+    0x00, 0xF3, 0x44, 0x0F, 0x7F, 0x94, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x7F, 0x8C, 0x24, 0x90, 0x00,
+    0x00, 0x00, 0xF3, 0x44, 0x0F, 0x7F, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x7F, 0x7C, 0x24, 0x70, 0xF3,
+    0x0F, 0x7F, 0x74, 0x24, 0x60, 0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x50, 0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x40, 0xF3, 0x0F,
+    0x7F, 0x5C, 0x24, 0x30, 0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x20, 0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x10, 0xF3, 0x0F, 0x7F,
+    0x04, 0x24, 0x48, 0x8B, 0xBC, 0x24, 0x80, 0x01, 0x00, 0x00, 0x48, 0x83, 0xC7, 0x10, 0x48, 0x89, 0xBC, 0x24, 0x80,
+    0x01, 0x00, 0x00, 0x48, 0x8D, 0x3C, 0x24, 0x48, 0x89, 0xE3, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x83, 0xE4, 0xF0, 0xFF,
+    0x15, 0xA8, 0x00, 0x00, 0x00, 0x48, 0x89, 0xDC, 0xF3, 0x0F, 0x6F, 0x04, 0x24, 0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x10,
+    0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x20, 0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x30, 0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x40, 0xF3,
+    0x0F, 0x6F, 0x6C, 0x24, 0x50, 0xF3, 0x0F, 0x6F, 0x74, 0x24, 0x60, 0xF3, 0x0F, 0x6F, 0x7C, 0x24, 0x70, 0xF3, 0x44,
+    0x0F, 0x6F, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x6F, 0x8C, 0x24, 0x90, 0x00, 0x00, 0x00, 0xF3,
+    0x44, 0x0F, 0x6F, 0x94, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x6F, 0x9C, 0x24, 0xB0, 0x00, 0x00, 0x00,
+    0xF3, 0x44, 0x0F, 0x6F, 0xA4, 0x24, 0xC0, 0x00, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x6F, 0xAC, 0x24, 0xD0, 0x00, 0x00,
+    0x00, 0xF3, 0x44, 0x0F, 0x6F, 0xB4, 0x24, 0xE0, 0x00, 0x00, 0x00, 0xF3, 0x44, 0x0F, 0x6F, 0xBC, 0x24, 0xF0, 0x00,
+    0x00, 0x00, 0x48, 0x81, 0xC4, 0x00, 0x01, 0x00, 0x00, 0x9D, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D, 0x41, 0x5C, 0x41,
+    0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5F, 0x5E, 0x5A, 0x59, 0x5B, 0x58, 0x5D, 0x48, 0x8D, 0x64, 0x24, 0x08,
+    0x5C, 0xC3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+#endif
 #elif SAFETYHOOK_ARCH_X86_32
 constexpr std::array<uint8_t, 171> asm_data = {0xFF, 0x35, 0xA7, 0x00, 0x00, 0x00, 0x54, 0x54, 0x55, 0x50, 0x53, 0x51,
     0x52, 0x56, 0x57, 0x9C, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x7F, 0x7C, 0x24, 0x70, 0xF3, 0x0F, 0x7F,
@@ -850,12 +942,221 @@ std::expected<void, MidHook::Error> MidHook::setup(
 } // namespace safetyhook
 
 //
-// Source file: thread_freezer.cpp
+// Source file: os.linux.cpp
+//
+
+
+#if SAFETYHOOK_OS_LINUX
+
+#include <cstdio>
+
+#include <sys/mman.h>
+#include <unistd.h>
+
+
+
+namespace safetyhook {
+std::expected<uint8_t*, OsError> vm_allocate(uint8_t* address, size_t size, VmAccess access) {
+    int prot = 0;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+
+    if (access == VM_ACCESS_R) {
+        prot = PROT_READ;
+    } else if (access == VM_ACCESS_RW) {
+        prot = PROT_READ | PROT_WRITE;
+    } else if (access == VM_ACCESS_RX) {
+        prot = PROT_READ | PROT_EXEC;
+    } else if (access == VM_ACCESS_RWX) {
+        prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+    } else {
+        return std::unexpected{OsError::FAILED_TO_ALLOCATE};
+    }
+
+    auto* result = mmap(address, size, prot, flags, -1, 0);
+
+    if (result == MAP_FAILED) {
+        return std::unexpected{OsError::FAILED_TO_ALLOCATE};
+    }
+
+    return static_cast<uint8_t*>(result);
+}
+
+void vm_free(uint8_t* address) {
+    munmap(address, 0);
+}
+
+std::expected<uint32_t, OsError> vm_protect(uint8_t* address, size_t size, VmAccess access) {
+    int prot = 0;
+
+    if (access == VM_ACCESS_R) {
+        prot = PROT_READ;
+    } else if (access == VM_ACCESS_RW) {
+        prot = PROT_READ | PROT_WRITE;
+    } else if (access == VM_ACCESS_RX) {
+        prot = PROT_READ | PROT_EXEC;
+    } else if (access == VM_ACCESS_RWX) {
+        prot = PROT_READ | PROT_WRITE | PROT_EXEC;
+    } else {
+        return std::unexpected{OsError::FAILED_TO_PROTECT};
+    }
+
+    return vm_protect(address, size, prot);
+}
+
+std::expected<uint32_t, OsError> vm_protect(uint8_t* address, size_t size, uint32_t protect) {
+    auto mbi = vm_query(address);
+
+    if (!mbi.has_value()) {
+        return std::unexpected{OsError::FAILED_TO_PROTECT};
+    }
+
+    uint32_t old_protect = 0;
+
+    if (mbi->access.read) {
+        old_protect |= PROT_READ;
+    }
+
+    if (mbi->access.write) {
+        old_protect |= PROT_WRITE;
+    }
+
+    if (mbi->access.execute) {
+        old_protect |= PROT_EXEC;
+    }
+
+    auto* addr = align_down(address, static_cast<size_t>(sysconf(_SC_PAGESIZE)));
+
+    if (mprotect(addr, size, static_cast<int>(protect)) == -1) {
+        return std::unexpected{OsError::FAILED_TO_PROTECT};
+    }
+
+    return old_protect;
+}
+
+std::expected<VmBasicInfo, OsError> vm_query(uint8_t* address) {
+    auto* maps = fopen("/proc/self/maps", "r");
+
+    if (maps == nullptr) {
+        return std::unexpected{OsError::FAILED_TO_QUERY};
+    }
+
+    char line[512];
+    unsigned long start;
+    unsigned long end;
+    char perms[5];
+    unsigned long offset;
+    int dev_major;
+    int dev_minor;
+    unsigned long inode;
+    char path[256];
+    unsigned long last_end =
+        reinterpret_cast<unsigned long>(system_info().min_address); // Track the end address of the last mapping.
+    auto addr = reinterpret_cast<unsigned long>(address);
+    std::optional<VmBasicInfo> info = std::nullopt;
+
+    while (fgets(line, sizeof(line), maps) != nullptr) {
+        path[0] = '\0';
+
+        sscanf(line, "%lx-%lx %4s %lx %x:%x %lu %255[^\n]", &start, &end, perms, &offset, &dev_major, &dev_minor,
+            &inode, path);
+
+        if (last_end < start && addr >= last_end && addr < start) {
+            info = {
+                .address = reinterpret_cast<uint8_t*>(last_end),
+                .size = start - last_end,
+                .access = VmAccess{},
+                .is_free = true,
+            };
+
+            break;
+        }
+
+        last_end = end;
+
+        if (addr >= start && addr < end) {
+            info = {
+                .address = reinterpret_cast<uint8_t*>(start),
+                .size = end - start,
+                .access = VmAccess{},
+                .is_free = false,
+            };
+
+            if (perms[0] == 'r') {
+                info->access.read = true;
+            }
+
+            if (perms[1] == 'w') {
+                info->access.write = true;
+            }
+
+            if (perms[2] == 'x') {
+                info->access.execute = true;
+            }
+
+            break;
+        }
+    }
+
+    fclose(maps);
+
+    if (!info.has_value()) {
+        return std::unexpected{OsError::FAILED_TO_QUERY};
+    }
+
+    return info.value();
+}
+
+bool vm_is_readable(uint8_t* address, [[maybe_unused]] size_t size) {
+    return vm_query(address).value_or(VmBasicInfo{}).access.read;
+}
+
+bool vm_is_writable(uint8_t* address, [[maybe_unused]] size_t size) {
+    return vm_query(address).value_or(VmBasicInfo{}).access.write;
+}
+
+bool vm_is_executable(uint8_t* address) {
+    return vm_query(address).value_or(VmBasicInfo{}).access.execute;
+}
+
+SystemInfo system_info() {
+    auto page_size = static_cast<uint32_t>(sysconf(_SC_PAGESIZE));
+
+    return {
+        .page_size = page_size,
+        .allocation_granularity = page_size,
+        .min_address = reinterpret_cast<uint8_t*>(0x10000),
+        .max_address = reinterpret_cast<uint8_t*>(1ull << 47),
+    };
+}
+
+void trap_threads([[maybe_unused]] uint8_t* from, [[maybe_unused]] uint8_t* to, [[maybe_unused]] size_t len,
+    const std::function<void()>& run_fn) {
+    auto from_protect = vm_protect(from, len, VM_ACCESS_RWX).value_or(0);
+    auto to_protect = vm_protect(to, len, VM_ACCESS_RWX).value_or(0);
+    run_fn();
+    vm_protect(to, len, to_protect);
+    vm_protect(from, len, from_protect);
+}
+
+void fix_ip([[maybe_unused]] ThreadContext ctx, [[maybe_unused]] uint8_t* old_ip, [[maybe_unused]] uint8_t* new_ip) {
+}
+
+} // namespace safetyhook
+
+#endif
+
+//
+// Source file: os.windows.cpp
 //
 
 #include <map>
+#include <memory>
 #include <mutex>
 
+
+#if SAFETYHOOK_OS_WINDOWS
+
+#define NOMINMAX
 #if __has_include(<Windows.h>)
 #include <Windows.h>
 #elif __has_include(<windows.h>)
@@ -865,8 +1166,140 @@ std::expected<void, MidHook::Error> MidHook::setup(
 #endif
 
 
-
 namespace safetyhook {
+std::expected<uint8_t*, OsError> vm_allocate(uint8_t* address, size_t size, VmAccess access) {
+    DWORD protect = 0;
+
+    if (access == VM_ACCESS_R) {
+        protect = PAGE_READONLY;
+    } else if (access == VM_ACCESS_RW) {
+        protect = PAGE_READWRITE;
+    } else if (access == VM_ACCESS_RX) {
+        protect = PAGE_EXECUTE_READ;
+    } else if (access == VM_ACCESS_RWX) {
+        protect = PAGE_EXECUTE_READWRITE;
+    } else {
+        return std::unexpected{OsError::FAILED_TO_ALLOCATE};
+    }
+
+    auto* result = VirtualAlloc(address, size, MEM_COMMIT | MEM_RESERVE, protect);
+
+    if (result == nullptr) {
+        return std::unexpected{OsError::FAILED_TO_ALLOCATE};
+    }
+
+    return static_cast<uint8_t*>(result);
+}
+
+void vm_free(uint8_t* address) {
+    VirtualFree(address, 0, MEM_RELEASE);
+}
+
+std::expected<uint32_t, OsError> vm_protect(uint8_t* address, size_t size, VmAccess access) {
+    DWORD protect = 0;
+
+    if (access == VM_ACCESS_R) {
+        protect = PAGE_READONLY;
+    } else if (access == VM_ACCESS_RW) {
+        protect = PAGE_READWRITE;
+    } else if (access == VM_ACCESS_RX) {
+        protect = PAGE_EXECUTE_READ;
+    } else if (access == VM_ACCESS_RWX) {
+        protect = PAGE_EXECUTE_READWRITE;
+    } else {
+        return std::unexpected{OsError::FAILED_TO_PROTECT};
+    }
+
+    return vm_protect(address, size, protect);
+}
+
+std::expected<uint32_t, OsError> vm_protect(uint8_t* address, size_t size, uint32_t protect) {
+    DWORD old_protect = 0;
+
+    if (VirtualProtect(address, size, protect, &old_protect) == FALSE) {
+        return std::unexpected{OsError::FAILED_TO_PROTECT};
+    }
+
+    return old_protect;
+}
+
+std::expected<VmBasicInfo, OsError> vm_query(uint8_t* address) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    auto result = VirtualQuery(address, &mbi, sizeof(mbi));
+
+    if (result == 0) {
+        return std::unexpected{OsError::FAILED_TO_QUERY};
+    }
+
+    VmAccess access{
+        .read = (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0,
+        .write = (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0,
+        .execute = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0,
+    };
+
+    return VmBasicInfo{
+        .address = static_cast<uint8_t*>(mbi.AllocationBase),
+        .size = mbi.RegionSize,
+        .access = access,
+        .is_free = mbi.State == MEM_FREE,
+    };
+}
+
+bool vm_is_readable(uint8_t* address, size_t size) {
+    return IsBadReadPtr(address, size) == FALSE;
+}
+
+bool vm_is_writable(uint8_t* address, size_t size) {
+    return IsBadWritePtr(address, size) == FALSE;
+}
+
+bool vm_is_executable(uint8_t* address) {
+    LPVOID image_base_ptr;
+
+    if (RtlPcToFileHeader(address, &image_base_ptr) == nullptr) {
+        return vm_query(address).value_or(VmBasicInfo{}).access.execute;
+    }
+
+    // Just check if the section is executable.
+    const auto* image_base = reinterpret_cast<uint8_t*>(image_base_ptr);
+    const auto* dos_hdr = reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base);
+
+    if (dos_hdr->e_magic != IMAGE_DOS_SIGNATURE) {
+        return vm_query(address).value_or(VmBasicInfo{}).access.execute;
+    }
+
+    const auto* nt_hdr = reinterpret_cast<const IMAGE_NT_HEADERS*>(image_base + dos_hdr->e_lfanew);
+
+    if (nt_hdr->Signature != IMAGE_NT_SIGNATURE) {
+        return vm_query(address).value_or(VmBasicInfo{}).access.execute;
+    }
+
+    const auto* section = IMAGE_FIRST_SECTION(nt_hdr);
+
+    for (auto i = 0; i < nt_hdr->FileHeader.NumberOfSections; ++i, ++section) {
+        if (address >= image_base + section->VirtualAddress &&
+            address < image_base + section->VirtualAddress + section->Misc.VirtualSize) {
+            return (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+        }
+    }
+
+    return vm_query(address).value_or(VmBasicInfo{}).access.execute;
+}
+
+SystemInfo system_info() {
+    SystemInfo info{};
+
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+
+    info.page_size = si.dwPageSize;
+    info.allocation_granularity = si.dwAllocationGranularity;
+    info.min_address = static_cast<uint8_t*>(si.lpMinimumApplicationAddress);
+    info.max_address = static_cast<uint8_t*>(si.lpMaximumApplicationAddress);
+
+    return info;
+}
+
 struct TrapInfo {
     uint8_t* page_start;
     uint8_t* page_end;
@@ -875,7 +1308,7 @@ struct TrapInfo {
     size_t len;
 };
 
-class TrapManager {
+class TrapManager final {
 public:
     static std::mutex mutex;
     static std::unique_ptr<TrapManager> instance;
@@ -1013,71 +1446,25 @@ void fix_ip(ThreadContext thread_ctx, uint8_t* old_ip, uint8_t* new_ip) {
     ctx->Eip = ip;
 #endif
 }
+
 } // namespace safetyhook
+
+#endif
 
 //
 // Source file: utility.cpp
 //
 
-#if __has_include(<Windows.h>)
-#include <Windows.h>
-#elif __has_include(<windows.h>)
-#include <windows.h>
-#else
-#error "Windows.h not found"
-#endif
 
 
 namespace safetyhook {
-bool is_page_executable(uint8_t* address) {
-    MEMORY_BASIC_INFORMATION mbi;
-
-    if (VirtualQuery(address, &mbi, sizeof(mbi)) == 0) {
-        return false;
-    }
-
-    const auto executable_protect = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-
-    return (mbi.Protect & executable_protect) != 0;
-}
-
 bool is_executable(uint8_t* address) {
-    LPVOID image_base_ptr;
-
-    if (RtlPcToFileHeader(address, &image_base_ptr) == nullptr) {
-        return is_page_executable(address);
-    }
-
-    // Just check if the section is executable.
-    const auto* image_base = reinterpret_cast<uint8_t*>(image_base_ptr);
-    const auto* dos_hdr = reinterpret_cast<const IMAGE_DOS_HEADER*>(image_base);
-
-    if (dos_hdr->e_magic != IMAGE_DOS_SIGNATURE) {
-        return is_page_executable(address);
-    }
-
-    const auto* nt_hdr = reinterpret_cast<const IMAGE_NT_HEADERS*>(image_base + dos_hdr->e_lfanew);
-
-    if (nt_hdr->Signature != IMAGE_NT_SIGNATURE) {
-        return is_page_executable(address);
-    }
-
-    const auto* section = IMAGE_FIRST_SECTION(nt_hdr);
-
-    for (auto i = 0; i < nt_hdr->FileHeader.NumberOfSections; ++i, ++section) {
-        if (address >= image_base + section->VirtualAddress &&
-            address < image_base + section->VirtualAddress + section->Misc.VirtualSize) {
-            return (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-        }
-    }
-
-    return is_page_executable(address);
+    return vm_is_executable(address);
 }
 
 UnprotectMemory::~UnprotectMemory() {
     if (m_address != nullptr) {
-        DWORD old_protection;
-        VirtualProtect(m_address, m_size, m_original_protection, &old_protection);
+        vm_protect(m_address, m_size, m_original_protection);
     }
 }
 
@@ -1099,13 +1486,13 @@ UnprotectMemory& UnprotectMemory::operator=(UnprotectMemory&& other) noexcept {
 }
 
 std::optional<UnprotectMemory> unprotect(uint8_t* address, size_t size) {
-    DWORD old_protection;
+    auto old_protection = vm_protect(address, size, VM_ACCESS_RWX);
 
-    if (!VirtualProtect(address, size, PAGE_EXECUTE_READWRITE, &old_protection)) {
-        return {};
+    if (!old_protection) {
+        return std::nullopt;
     }
 
-    return UnprotectMemory{address, size, old_protection};
+    return UnprotectMemory{address, size, old_protection.value()};
 }
 
 } // namespace safetyhook
@@ -1113,14 +1500,6 @@ std::optional<UnprotectMemory> unprotect(uint8_t* address, size_t size) {
 //
 // Source file: vmt_hook.cpp
 //
-
-#if __has_include(<Windows.h>)
-#include <Windows.h>
-#elif __has_include(<windows.h>)
-#include <windows.h>
-#else
-#error "Windows.h not found"
-#endif
 
 
 
@@ -1226,7 +1605,7 @@ void VmtHook::remove(void* object) {
 
     const auto original_vmt = search->second;
 
-    if (IsBadWritePtr(object, sizeof(void*))) {
+    if (!vm_is_writable(reinterpret_cast<uint8_t*>(object), sizeof(void*))) {
         m_objects.erase(search);
         return;
     }
@@ -1247,7 +1626,7 @@ void VmtHook::reset() {
 
 void VmtHook::destroy() {
     for (const auto [object, original_vmt] : m_objects) {
-        if (IsBadWritePtr(object, sizeof(void*))) {
+        if (!vm_is_writable(reinterpret_cast<uint8_t*>(object), sizeof(void*))) {
             continue;
         }
 
