@@ -405,42 +405,54 @@ public:
         [[nodiscard]] static Error not_enough_space(uint8_t* ip) { return {.type = NOT_ENOUGH_SPACE, .ip = ip}; }
     };
 
-    /// @brief Create an inline hook.
-    /// @param target The address of the function to hook.
-    /// @param destination The destination address.
-    /// @return The InlineHook or an InlineHook::Error if an error occurred.
-    /// @note This will use the default global Allocator.
-    /// @note If you don't care about error handling, use the easy API (safetyhook::create_inline).
-    [[nodiscard]] static std::expected<InlineHook, Error> create(void* target, void* destination);
+    /// @brief Flags for InlineHook.
+    enum Flags : int {
+        Default = 0,            ///< Default flags.
+        StartDisabled = 1 << 0, ///< Start the hook disabled.
+    };
 
     /// @brief Create an inline hook.
     /// @param target The address of the function to hook.
     /// @param destination The destination address.
+    /// @param flags The flags to use.
     /// @return The InlineHook or an InlineHook::Error if an error occurred.
     /// @note This will use the default global Allocator.
     /// @note If you don't care about error handling, use the easy API (safetyhook::create_inline).
-    [[nodiscard]] static std::expected<InlineHook, Error> create(FnPtr auto target, FnPtr auto destination) {
-        return create(reinterpret_cast<void*>(target), reinterpret_cast<void*>(destination));
+    [[nodiscard]] static std::expected<InlineHook, Error> create(
+        void* target, void* destination, Flags flags = Default);
+
+    /// @brief Create an inline hook.
+    /// @param target The address of the function to hook.
+    /// @param destination The destination address.
+    /// @param flags The flags to use.
+    /// @return The InlineHook or an InlineHook::Error if an error occurred.
+    /// @note This will use the default global Allocator.
+    /// @note If you don't care about error handling, use the easy API (safetyhook::create_inline).
+    [[nodiscard]] static std::expected<InlineHook, Error> create(
+        FnPtr auto target, FnPtr auto destination, Flags flags = Default) {
+        return create(reinterpret_cast<void*>(target), reinterpret_cast<void*>(destination), flags);
     }
 
     /// @brief Create an inline hook with a given Allocator.
     /// @param allocator The allocator to use.
     /// @param target The address of the function to hook.
     /// @param destination The destination address.
+    /// @param flags The flags to use.
     /// @return The InlineHook or an InlineHook::Error if an error occurred.
     /// @note If you don't care about error handling, use the easy API (safetyhook::create_inline).
     [[nodiscard]] static std::expected<InlineHook, Error> create(
-        const std::shared_ptr<Allocator>& allocator, void* target, void* destination);
+        const std::shared_ptr<Allocator>& allocator, void* target, void* destination, Flags flags = Default);
 
     /// @brief Create an inline hook with a given Allocator.
     /// @param allocator The allocator to use.
     /// @param target The address of the function to hook.
     /// @param destination The destination address.
+    /// @param flags The flags to use.
     /// @return The InlineHook or an InlineHook::Error if an error occurred.
     /// @note If you don't care about error handling, use the easy API (safetyhook::create_inline).
     [[nodiscard]] static std::expected<InlineHook, Error> create(
-        const std::shared_ptr<Allocator>& allocator, FnPtr auto target, FnPtr auto destination) {
-        return create(allocator, reinterpret_cast<void*>(target), reinterpret_cast<void*>(destination));
+        const std::shared_ptr<Allocator>& allocator, FnPtr auto target, FnPtr auto destination, Flags flags = Default) {
+        return create(allocator, reinterpret_cast<void*>(target), reinterpret_cast<void*>(destination), flags);
     }
 
     InlineHook() = default;
@@ -603,8 +615,23 @@ public:
         return original<RetT(SAFETYHOOK_FASTCALL*)(Args...)>()(args...);
     }
 
+    /// @brief Enable the hook.
+    [[nodiscard]] std::expected<void, Error> enable();
+
+    /// @brief Disable the hook.
+    [[nodiscard]] std::expected<void, Error> disable();
+
+    /// @brief Check if the hook is enabled.
+    [[nodiscard]] bool enabled() const { return m_enabled; }
+
 private:
     friend class MidHook;
+
+    enum class Type {
+        Unset,
+        E9,
+        FF,
+    };
 
     uint8_t* m_target{};
     uint8_t* m_destination{};
@@ -612,6 +639,8 @@ private:
     std::vector<uint8_t> m_original_bytes{};
     uintptr_t m_trampoline_size{};
     std::recursive_mutex m_mutex{};
+    bool m_enabled{};
+    Type m_type{Type::Unset};
 
     std::expected<void, Error> setup(
         const std::shared_ptr<Allocator>& allocator, uint8_t* target, uint8_t* destination);
@@ -749,43 +778,55 @@ public:
         }
     };
 
-    /// @brief Creates a new MidHook object.
-    /// @param target The address of the function to hook.
-    /// @param destination_fn The destination function.
-    /// @return The MidHook object or a MidHook::Error if an error occurred.
-    /// @note This will use the default global Allocator.
-    /// @note If you don't care about error handling, use the easy API (safetyhook::create_mid).
-    [[nodiscard]] static std::expected<MidHook, Error> create(void* target, MidHookFn destination_fn);
+    /// @brief Flags for MidHook.
+    enum Flags : int {
+        Default = 0,       ///< Default flags.
+        StartDisabled = 1, ///< Start the hook disabled.
+    };
 
     /// @brief Creates a new MidHook object.
     /// @param target The address of the function to hook.
     /// @param destination_fn The destination function.
+    /// @param flags The flags to use.
     /// @return The MidHook object or a MidHook::Error if an error occurred.
     /// @note This will use the default global Allocator.
     /// @note If you don't care about error handling, use the easy API (safetyhook::create_mid).
-    [[nodiscard]] static std::expected<MidHook, Error> create(FnPtr auto target, MidHookFn destination_fn) {
-        return create(reinterpret_cast<void*>(target), destination_fn);
+    [[nodiscard]] static std::expected<MidHook, Error> create(
+        void* target, MidHookFn destination_fn, Flags flags = Default);
+
+    /// @brief Creates a new MidHook object.
+    /// @param target The address of the function to hook.
+    /// @param destination_fn The destination function.
+    /// @param flags The flags to use.
+    /// @return The MidHook object or a MidHook::Error if an error occurred.
+    /// @note This will use the default global Allocator.
+    /// @note If you don't care about error handling, use the easy API (safetyhook::create_mid).
+    [[nodiscard]] static std::expected<MidHook, Error> create(
+        FnPtr auto target, MidHookFn destination_fn, Flags flags = Default) {
+        return create(reinterpret_cast<void*>(target), destination_fn, flags);
     }
 
     /// @brief Creates a new MidHook object with a given Allocator.
     /// @param allocator The Allocator to use.
     /// @param target The address of the function to hook.
     /// @param destination_fn The destination function.
+    /// @param flags The flags to use.
     /// @return The MidHook object or a MidHook::Error if an error occurred.
     /// @note If you don't care about error handling, use the easy API (safetyhook::create_mid).
     [[nodiscard]] static std::expected<MidHook, Error> create(
-        const std::shared_ptr<Allocator>& allocator, void* target, MidHookFn destination_fn);
+        const std::shared_ptr<Allocator>& allocator, void* target, MidHookFn destination_fn, Flags flags = Default);
 
     /// @brief Creates a new MidHook object with a given Allocator.
     /// @tparam T The type of the function to hook.
     /// @param allocator The Allocator to use.
     /// @param target The address of the function to hook.
     /// @param destination_fn The destination function.
+    /// @param flags The flags to use.
     /// @return The MidHook object or a MidHook::Error if an error occurred.
     /// @note If you don't care about error handling, use the easy API (safetyhook::create_mid).
-    [[nodiscard]] static std::expected<MidHook, Error> create(
-        const std::shared_ptr<Allocator>& allocator, FnPtr auto target, MidHookFn destination_fn) {
-        return create(allocator, reinterpret_cast<void*>(target), destination_fn);
+    [[nodiscard]] static std::expected<MidHook, Error> create(const std::shared_ptr<Allocator>& allocator,
+        FnPtr auto target, MidHookFn destination_fn, Flags flags = Default) {
+        return create(allocator, reinterpret_cast<void*>(target), destination_fn, flags);
     }
 
     MidHook() = default;
@@ -819,6 +860,15 @@ public:
     /// @brief Tests if the hook is valid.
     /// @return true if the hook is valid, false otherwise.
     explicit operator bool() const { return static_cast<bool>(m_stub); }
+
+    /// @brief Enable the hook.
+    [[nodiscard]] std::expected<void, Error> enable();
+
+    /// @brief Disable the hook.
+    [[nodiscard]] std::expected<void, Error> disable();
+
+    /// @brief Check if the hook is enabled.
+    [[nodiscard]] bool enabled() const { return m_hook.enabled(); }
 
 private:
     InlineHook m_hook{};
@@ -1008,29 +1058,34 @@ namespace safetyhook {
 /// @brief Easy to use API for creating an InlineHook.
 /// @param target The address of the function to hook.
 /// @param destination The address of the destination function.
+/// @param flags The flags to use.
 /// @return The InlineHook object.
-[[nodiscard]] InlineHook create_inline(void* target, void* destination);
+[[nodiscard]] InlineHook create_inline(void* target, void* destination, InlineHook::Flags flags = InlineHook::Default);
 
 /// @brief Easy to use API for creating an InlineHook.
 /// @param target The address of the function to hook.
 /// @param destination The address of the destination function.
+/// @param flags The flags to use.
 /// @return The InlineHook object.
-[[nodiscard]] InlineHook create_inline(FnPtr auto target, FnPtr auto destination) {
-    return create_inline(reinterpret_cast<void*>(target), reinterpret_cast<void*>(destination));
+[[nodiscard]] InlineHook create_inline(
+    FnPtr auto target, FnPtr auto destination, InlineHook::Flags flags = InlineHook::Default) {
+    return create_inline(reinterpret_cast<void*>(target), reinterpret_cast<void*>(destination), flags);
 }
 
 /// @brief Easy to use API for creating a MidHook.
 /// @param target the address of the function to hook.
 /// @param destination The destination function.
+/// @param flags The flags to use.
 /// @return The MidHook object.
-[[nodiscard]] MidHook create_mid(void* target, MidHookFn destination);
+[[nodiscard]] MidHook create_mid(void* target, MidHookFn destination, MidHook::Flags = MidHook::Default);
 
 /// @brief Easy to use API for creating a MidHook.
 /// @param target the address of the function to hook.
 /// @param destination The destination function.
+/// @param flags The flags to use.
 /// @return The MidHook object.
-[[nodiscard]] MidHook create_mid(FnPtr auto target, MidHookFn destination) {
-    return create_mid(reinterpret_cast<void*>(target), destination);
+[[nodiscard]] MidHook create_mid(FnPtr auto target, MidHookFn destination, MidHook::Flags flags = MidHook::Default) {
+    return create_mid(reinterpret_cast<void*>(target), destination, flags);
 }
 
 /// @brief Easy to use API for creating a VmtHook.
