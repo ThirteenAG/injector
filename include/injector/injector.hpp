@@ -436,7 +436,7 @@ inline memory_pointer_raw GetAbsoluteOffset(int rel_value, memory_pointer_tr end
  *  GetRelativeOffset
  *      Gets relative offset based on absolute address @abs_value for instruction that ends at @end_of_instruction
  */
-inline int GetRelativeOffset(memory_pointer_tr abs_value, memory_pointer_tr end_of_instruction)
+inline uintptr_t GetRelativeOffset(memory_pointer_tr abs_value, memory_pointer_tr end_of_instruction)
 {
     return uintptr_t(abs_value.get<char>() - end_of_instruction.get<char>());
 }
