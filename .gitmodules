@@ -7,3 +7,6 @@
 [submodule "kananlib"]
 	path = kananlib
 	url = https://github.com/cursey/kananlib
+[submodule "minhook"]
+	path = minhook
+	url = https://github.com/TsudaKageyu/minhook
