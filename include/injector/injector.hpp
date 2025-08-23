@@ -705,9 +705,16 @@ inline bool game_version_manager::Detect()
     this->Clear();
 
     // Find NT header
-    uintptr_t          base     = (uintptr_t) GetModuleHandleA(NULL);
-    IMAGE_DOS_HEADER*  dos      = (IMAGE_DOS_HEADER*)(base);
-    IMAGE_NT_HEADERS*  nt       = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    auto base = (uintptr_t)GetModuleHandleA(NULL);
+    
+    DWORD oldVP;
+
+    auto dos = (IMAGE_DOS_HEADER*)(base);
+    VirtualProtect(dos, sizeof(IMAGE_DOS_HEADER), PAGE_EXECUTE_READWRITE, &oldVP);
+
+    auto nt = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    VirtualProtect(nt, sizeof(IMAGE_NT_HEADERS), PAGE_EXECUTE_READWRITE, &oldVP);
+
             
     // Look for game and version thought the entry-point
     // Thanks to Silent for many of the entry point offsets
