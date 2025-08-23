@@ -47,7 +47,7 @@ class game_version_manager
         const char* PluginName;
         
     private:
-        char game, region, major, minor, majorRevision, minorRevision, cracker, steam;
+        char game, region, major, minor, majorRevision, minorRevision, steam;
 
     public:
         game_version_manager()
@@ -65,7 +65,7 @@ class game_version_manager
         // Clear any information about game version
         void Clear()
         {
-            game = region = major = minor = majorRevision = minorRevision = cracker = steam = 0;
+            game = region = major = minor = majorRevision = minorRevision = steam = 0;
         }
         
         // Checks if I don't know the game we are attached to
@@ -81,8 +81,6 @@ class game_version_manager
         int GetMinorVersion()	{ return minor; }
         int GetMajorRevisionVersion()	{ return majorRevision; }
         int GetMinorRevisionVersion()	{ return minorRevision; }
-        
-        bool IsHoodlum()        { return cracker == 'H'; }
         
         // Region conditions
         bool IsUS() { return region == 'U'; }
