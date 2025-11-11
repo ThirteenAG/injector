@@ -289,10 +289,10 @@ inline bool UnprotectMemory(memory_pointer_tr addr, size_t size, DWORD& out_oldp
  */
 struct scoped_unprotect
 {
-    memory_pointer_raw  addr;
-    size_t              size;
-    DWORD               dwOldProtect;
-    bool                bUnprotected;
+    memory_pointer_raw  addr{};
+    size_t              size{0};
+    DWORD               dwOldProtect{0};
+    bool                bUnprotected{false};
 
     scoped_unprotect(memory_pointer_tr addr, size_t size)
     {
@@ -480,9 +480,9 @@ inline void MakeRelativeOffset(memory_pointer_tr at, memory_pointer_tr dest, siz
 {
     switch(sizeof_addr)
     {
-        case 1: WriteMemory<int8_t> (at, static_cast<int8_t> (GetRelativeOffset(dest, at+sizeof_addr)), vp);
-        case 2: WriteMemory<int16_t>(at, static_cast<int16_t>(GetRelativeOffset(dest, at+sizeof_addr)), vp);
-        case 4: WriteMemory<int32_t>(at, static_cast<int32_t>(GetRelativeOffset(dest, at+sizeof_addr)), vp);
+        case 1: return WriteMemory<int8_t> (at, static_cast<int8_t> (GetRelativeOffset(dest, at+sizeof_addr)), vp);
+        case 2: return WriteMemory<int16_t>(at, static_cast<int16_t>(GetRelativeOffset(dest, at+sizeof_addr)), vp);
+        case 4: return WriteMemory<int32_t>(at, static_cast<int32_t>(GetRelativeOffset(dest, at+sizeof_addr)), vp);
     }
 }
 
