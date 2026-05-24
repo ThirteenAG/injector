@@ -187,11 +187,12 @@ class address_manager : public game_version_manager
             return singleton().translate(p);
         }
         
-        //
+#ifndef INJECTOR_GVM_DUMMY
         static void set_name(const char* modname)
         {
             singleton().PluginName = modname;
         }
+#endif
         
     public:
         // Functors for memory translation:
