@@ -623,7 +623,7 @@ inline void MakeRET(memory_pointer_tr at, uint16_t pop = 0, bool vp = true)
          template<class T>
          static T* get()
          {
-             return get().get<T>();
+             return get().template get<T>();
          }
 
     private:
