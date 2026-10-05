@@ -76,16 +76,16 @@ namespace injector
             }
 
             // Save buffer at @addr with @size and virtual protect @vp
-            virtual void save(memory_pointer_tr addr, size_t size, bool vp)
+            virtual void save(memory_pointer_tr address, size_t length, bool protect)
             {
                 #ifndef INJECTOR_SCOPED_NOSAVE_NORESTORE
-                    assert(size <= bufsize);            // Debug Safeness
+                    assert(length <= bufsize);          // Debug Safeness
                     this->restore();                    // Restore anything we have saved
                     this->saved = true;                 // Mark that we have data save
-                    this->addr = addr.get<void>();      // Save address
-                    this->size = size;                  // Save size
-                    this->vp = vp;                      // Save virtual protect
-                    ReadMemoryRaw(addr, buf, size, vp); // Save buffer
+                    this->addr = address.get<void>();   // Save address
+                    this->size = length;                // Save size
+                    this->vp = protect;                 // Save virtual protect
+                    ReadMemoryRaw(address, buf, length, protect); // Save buffer
                 #endif
             }
 
@@ -109,7 +109,8 @@ namespace injector
             scoped_basic& operator=(const scoped_basic& rhs) = delete;
             scoped_basic& operator=(scoped_basic&& rhs)
             {
-                if(this->saved = rhs.saved)
+                this->saved = rhs.saved;
+                if(this->saved)
                 {
                     assert(bufsize >= rhs.size);
 
@@ -215,10 +216,10 @@ namespace injector
     {
         public:
             // Makes NOP at @addr with value @value and size @size and virtual protect @vp
-            memory_pointer_raw make_jmp(memory_pointer_tr at, memory_pointer_raw dest, bool vp = true)
+            memory_pointer_raw make_jmp(memory_pointer_tr at, memory_pointer_raw dest, bool protect = true)
             {
-                this->save(at, 5, vp);
-                return MakeJMP(at, dest, vp);
+                this->save(at, 5, protect);
+                return MakeJMP(at, dest, protect);
             }
 
             // Constructors, move constructors, assigment operators........
@@ -240,10 +241,10 @@ namespace injector
     {
         public:
             // Makes NOP at @addr with value @value and size @size and virtual protect @vp
-            memory_pointer_raw make_call(memory_pointer_tr at, memory_pointer_raw dest, bool vp = true)
+            memory_pointer_raw make_call(memory_pointer_tr at, memory_pointer_raw dest, bool protect = true)
             {
-                this->save(at, 5, vp);
-                return MakeCALL(at, dest, vp);
+                this->save(at, 5, protect);
+                return MakeCALL(at, dest, protect);
             }
 
             // Constructors, move constructors, assigment operators........
