@@ -87,18 +87,24 @@ static inline int pcsx2_hook_has_delay_slot(uint32_t w)
     return op >= 16 && op <= 18 && rs == 8;
 }
 
-/* 0 = ordinary, 1 = branch, 2 = J, 3 = JR, -1 = cannot relocate safely. */
+/* 0 = ordinary, 1 = branch, 2 = J, 3 = JR, 4 = JAL, 5 = JALR,
+ * 6 = linking REGIMM branch, -1 = cannot relocate safely. */
 static inline int pcsx2_hook_control(uint32_t w)
 {
     unsigned op = pcsx2_hook_op(w), rs = (w >> 21) & 31, rt = (w >> 16) & 31;
     if (op == 2) return 2;
-    if (op == 3) return -1; /* Link values observed by callees would change. */
+    if (op == 3) return 4;
     if (op == 0) {
         unsigned fn = w & 63;
         if (fn == 8) return 3;
-        if (fn == 9 || fn == 12 || fn == 13 || (fn >= 48 && fn <= 54)) return -1;
+        if (fn == 9) return 5;
+        if (fn == 12 || fn == 13 || (fn >= 48 && fn <= 54)) return -1;
     }
-    if (op == 1) return rt <= 3 ? 1 : -1; /* Reject link branches and traps. */
+    if (op == 1) {
+        if (rt <= 3) return 1;
+        if (rt >= 16 && rt <= 19) return 6;
+        return (rt == 24 || rt == 25) ? 0 : -1; /* EE MTSAB/MTSAH; reject traps. */
+    }
     if ((op >= 4 && op <= 7) || (op >= 20 && op <= 23)) return 1;
     if (op >= 16 && op <= 18) {
         if (rs == 8) return rt <= 3 ? 1 : -1;
@@ -125,12 +131,18 @@ static inline int pcsx2_hook_branch_fits(uint32_t pc, uint32_t target)
     return !(target & 3) && delta >= -131072 && delta <= 131068;
 }
 
-/* Pure relocation: no allocations, reads, writes, or patching of live memory. */
+/* Pure relocation: no allocations, reads, writes, or patching of live memory.
+ * Linking instructions keep their delay slot. When the call pair ends the window,
+ * the link register receives the original return address (the window end), so the
+ * callee returns straight to game code exactly as before. A call earlier in the
+ * window links back into the trampoline, which then runs the rest of the window;
+ * such code must stay alive while that callee can still return. */
 static inline pcsx2_hook_status pcsx2_hook_relocate(
     const uint32_t* source, size_t count, uint32_t source_pc,
     uint32_t* output, size_t capacity, uint32_t output_pc, size_t* written)
 {
     size_t map[PCSX2_HOOK_MAX_INSTRUCTIONS], sizes[PCSX2_HOOK_MAX_INSTRUCTIONS];
+    size_t lead[PCSX2_HOOK_MAX_INSTRUCTIONS];
     size_t i, used = 0;
     uint32_t end;
     if (!source || !output || !written || !count || count > PCSX2_HOOK_MAX_INSTRUCTIONS)
@@ -142,17 +154,25 @@ static inline pcsx2_hook_status pcsx2_hook_relocate(
     for (i = 0; i < count;) {
         int control = pcsx2_hook_control(source[i]);
         uint32_t target = pcsx2_hook_target(source_pc + (uint32_t)i * 4, source[i]);
+        unsigned rs = (source[i] >> 21) & 31, rd = (source[i] >> 11) & 31;
+        int last = i + 2 == count;
         if (control < 0) return PCSX2_HOOK_UNSUPPORTED_INSTRUCTION;
         map[i] = used;
         sizes[i] = 1;
+        lead[i] = 0;
         if (control) {
             if (i + 1 == count) return PCSX2_HOOK_DELAY_SLOT;
             if (pcsx2_hook_control(source[i + 1]) != 0) return PCSX2_HOOK_DELAY_SLOT;
+            /* The architecture leaves these link forms unpredictable. */
+            if ((control == 5 && rd && rd == rs) || (control == 6 && rs == 31))
+                return PCSX2_HOOK_UNSUPPORTED_INSTRUCTION;
+            if ((control == 4 && last) || (control == 5 && last && rd) || control == 6) lead[i] = 2;
             sizes[i] = 2;
-            if (control == 1 && !(target >= source_pc && target < end) &&
-                !pcsx2_hook_branch_fits(output_pc + (uint32_t)used * 4, target))
+            if ((control == 1 || control == 6) && !(target >= source_pc && target < end) &&
+                !pcsx2_hook_branch_fits(output_pc + (uint32_t)(used + lead[i]) * 4, target))
                 sizes[i] = 6;
-            map[i + 1] = used + 1;
+            sizes[i] += lead[i];
+            map[i + 1] = used + lead[i] + 1;
             sizes[i + 1] = 0;
             used += sizes[i];
             i += 2;
@@ -166,37 +186,49 @@ static inline pcsx2_hook_status pcsx2_hook_relocate(
         uint32_t pc, target;
         if (!sizes[i]) continue;
         control = pcsx2_hook_control(source[i]);
-        pc = output_pc + (uint32_t)map[i] * 4;
+        pc = output_pc + (uint32_t)(map[i] + lead[i]) * 4;
         target = pcsx2_hook_target(source_pc + (uint32_t)i * 4, source[i]);
         if (target >= source_pc && target < end)
             target = output_pc + (uint32_t)map[(target - source_pc) / 4] * 4;
-        if ((control == 2 && !pcsx2_hook_jump_fits(pc, target)) ||
-            (sizes[i] == 6 && (!pcsx2_hook_jump_fits(pc + 8, pc + 24) ||
-                              !pcsx2_hook_jump_fits(pc + 16, target))))
+        if (((control == 2 || control == 4) && !pcsx2_hook_jump_fits(pc, target)) ||
+            (sizes[i] - lead[i] == 6 && (!pcsx2_hook_jump_fits(pc + 8, pc + 24) ||
+                                         !pcsx2_hook_jump_fits(pc + 16, target))))
             return PCSX2_HOOK_OUT_OF_RANGE;
-        if (control == 1 && sizes[i] == 2 && !pcsx2_hook_branch_fits(pc, target))
+        if ((control == 1 || control == 6) && sizes[i] - lead[i] == 2 &&
+            !pcsx2_hook_branch_fits(pc, target))
             return PCSX2_HOOK_OUT_OF_RANGE;
     }
     if (!pcsx2_hook_jump_fits(output_pc + (uint32_t)used * 4, end))
         return PCSX2_HOOK_OUT_OF_RANGE;
     for (i = 0; i < count;) {
         int control = pcsx2_hook_control(source[i]);
-        uint32_t pc = output_pc + (uint32_t)map[i] * 4;
-        uint32_t target = pcsx2_hook_target(source_pc + (uint32_t)i * 4, source[i]);
-        size_t n = map[i];
+        uint32_t word = source[i];
+        uint32_t target = pcsx2_hook_target(source_pc + (uint32_t)i * 4, word);
+        size_t n = map[i], k = map[i] + lead[i];
+        uint32_t pc = output_pc + (uint32_t)k * 4;
         if (target >= source_pc && target < end)
             target = output_pc + (uint32_t)map[(target - source_pc) / 4] * 4;
-        output[n] = source[i];
-        if (control == 2) output[n] = pcsx2_hook_jump(target);
-        if (control == 1) {
+        if (lead[i]) {
+            /* Link register = original return point (window end) or next relocated word. */
+            unsigned link = control == 5 ? (word >> 11) & 31 : 31;
+            uint32_t back = i + 2 == count ? end : output_pc + (uint32_t)(n + sizes[i]) * 4;
+            output[n] = pcsx2_hook_i(15, 0, link, (int)(back >> 16));
+            output[n + 1] = pcsx2_hook_i(13, link, link, (int)(back & 0xffff));
+        }
+        output[k] = word;
+        if (control == 2) output[k] = pcsx2_hook_jump(target);
+        if (control == 4) output[k] = lead[i] ? pcsx2_hook_jump(target) : 0x0c000000u | ((target >> 2) & 0x03ffffffu);
+        if (control == 5 && lead[i]) output[k] = (word & (31u << 21)) | 8; /* jr rs */
+        if (control == 6) word = (word & ~(31u << 16)) | ((((word >> 16) & 31) - 16) << 16);
+        if (control == 1 || control == 6) {
             int64_t offset = ((int64_t)target - ((int64_t)pc + 4)) / 4;
-            output[n] = (source[i] & 0xffff0000u) | (sizes[i] == 6 ? 3u : (uint16_t)offset);
+            output[k] = (word & 0xffff0000u) | (sizes[i] - lead[i] == 6 ? 3u : (uint16_t)offset);
         }
         if (control) {
-            output[n + 1] = source[i + 1];
-            if (sizes[i] == 6) {
-                output[n + 2] = pcsx2_hook_jump(pc + 24); output[n + 3] = 0;
-                output[n + 4] = pcsx2_hook_jump(target); output[n + 5] = 0;
+            output[k + 1] = source[i + 1];
+            if (sizes[i] - lead[i] == 6) {
+                output[k + 2] = pcsx2_hook_jump(pc + 24); output[k + 3] = 0;
+                output[k + 4] = pcsx2_hook_jump(target); output[k + 5] = 0;
             }
             i += 2;
         } else ++i;
@@ -207,8 +239,8 @@ static inline pcsx2_hook_status pcsx2_hook_relocate(
 }
 
 /* Shared preparation captures a complete instruction/delay-slot window. */
-static inline pcsx2_hook_status pcsx2_hook_prepare(
-    pcsx2_hook* hook, const pcsx2_hook_backend* backend, uint32_t address, size_t count, size_t prefix_words)
+static inline pcsx2_hook_status pcsx2_hook_prepare_ex(
+    pcsx2_hook* hook, const pcsx2_hook_backend* backend, uint32_t address, size_t count, size_t prefix_words, int replace)
 {
     uint32_t previous;
     size_t i;
@@ -227,8 +259,10 @@ static inline pcsx2_hook_status pcsx2_hook_prepare(
         return PCSX2_HOOK_READ_FAILED;
     for (i = 0; i < hook->count; ++i) {
         int control = pcsx2_hook_control(hook->original[i]);
-        if (control < 0) return PCSX2_HOOK_UNSUPPORTED_INSTRUCTION;
-        if (control) {
+        int call = pcsx2_hook_op(hook->original[i]) == 3 ||
+            (pcsx2_hook_op(hook->original[i]) == 0 && (hook->original[i] & 63) == 9);
+        if (control < 0 && !(replace && call)) return PCSX2_HOOK_UNSUPPORTED_INSTRUCTION;
+        if (pcsx2_hook_has_delay_slot(hook->original[i])) {
             if (i + 1 == hook->count) {
                 if (hook->count == PCSX2_HOOK_MAX_INSTRUCTIONS) return PCSX2_HOOK_DELAY_SLOT;
                 if (!backend->read(backend->user, address + (uint32_t)hook->count * 4,
@@ -238,7 +272,8 @@ static inline pcsx2_hook_status pcsx2_hook_prepare(
             if (pcsx2_hook_control(hook->original[++i]) != 0) return PCSX2_HOOK_DELAY_SLOT;
         }
     }
-    code_bytes = (prefix_words + hook->count * 3 + 2) * 4;
+    /* A linking far branch relocates to eight words per instruction pair. */
+    code_bytes = (prefix_words + hook->count * 4 + 2) * 4;
     code_bytes = (code_bytes + 15) & ~(size_t)15;
     if (!backend->allocate(backend->user, code_bytes, address, &hook->code))
         return PCSX2_HOOK_ALLOCATION_FAILED;
@@ -250,6 +285,10 @@ static inline pcsx2_hook_status pcsx2_hook_prepare(
     }
     return PCSX2_HOOK_OK;
 }
+
+static inline pcsx2_hook_status pcsx2_hook_prepare(
+    pcsx2_hook* hook, const pcsx2_hook_backend* backend, uint32_t address, size_t count, size_t prefix_words)
+{ return pcsx2_hook_prepare_ex(hook, backend, address, count, prefix_words, 0); }
 
 static inline void pcsx2_hook_discard(pcsx2_hook* hook)
 {
@@ -368,11 +407,12 @@ static inline pcsx2_hook_status pcsx2_hook_create_mid(pcsx2_hook* hook,
     if ((flags & (PCSX2_HOOK_SAVE_ACC | PCSX2_HOOK_SAVE_VU0)) &&
         (!backend || !backend->state_service || (backend->state_service & 3)))
         return PCSX2_HOOK_BACKEND_UNAVAILABLE;
-    status = pcsx2_hook_prepare(hook, backend, address, count,
+    status = pcsx2_hook_prepare_ex(hook, backend, address, count,
                               ((flags & PCSX2_HOOK_REPLACE_INSTRUCTIONS) ? 2 : 0) +
                               (flags & PCSX2_HOOK_SAVE_FPU ? 155 : 87) +
                               (flags & (PCSX2_HOOK_SAVE_ACC | PCSX2_HOOK_SAVE_VU0) ?
-                                  20 + (flags & PCSX2_HOOK_RAW_CALLBACK ? 8 : 0) : 0));
+                                  20 + (flags & PCSX2_HOOK_RAW_CALLBACK ? 8 : 0) : 0),
+                              (flags & PCSX2_HOOK_REPLACE_INSTRUCTIONS) != 0);
     if (status != PCSX2_HOOK_OK) return status;
     if (callback >= address && callback < address + hook->count * 4) {
         pcsx2_hook_discard(hook); return PCSX2_HOOK_INVALID_ARGUMENT;
@@ -425,10 +465,16 @@ static inline pcsx2_hook_status pcsx2_hook_create_mid(pcsx2_hook* hook,
     /* Fall through with every restored register intact. No scratch jump. */
     if (flags & PCSX2_HOOK_REPLACE_INSTRUCTIONS) {
         uint32_t resume = address + (uint32_t)hook->count * 4;
-        if (!pcsx2_hook_jump_fits(hook->code.address + (uint32_t)n * 4, resume)) {
+        if (!pcsx2_hook_jump_fits(hook->address, hook->code.address) ||
+            !pcsx2_hook_jump_fits(hook->code.address + (uint32_t)n * 4, resume)) {
             pcsx2_hook_discard(hook); return PCSX2_HOOK_OUT_OF_RANGE;
         }
         w[n++] = pcsx2_hook_jump(resume); w[n++] = 0;
+        hook->trampoline = 0; /* Replaced instructions have no callable original. */
+        hook->code_size = n * 4;
+        memset(hook->patch, 0, sizeof(hook->patch));
+        hook->patch[0] = pcsx2_hook_jump(hook->code.address);
+        return PCSX2_HOOK_OK;
     }
     return pcsx2_hook_finish(hook, n, hook->code.address);
 }

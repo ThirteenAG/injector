@@ -12,6 +12,9 @@ struct Options {
     unsigned preserve = PSP_HOOK_SAVE_FPU | PSP_HOOK_SAVE_VFPU;
     uint32_t module_gp = 0;
     bool execute_original = true;
+    // Integer-only callbacks that inspect the native return address can opt out.
+    // They must not call floating-point SDK routines or clobber native f28/f30.
+    bool preserve_game_callees = true;
 };
 
 // Owned inline/mid hooks restore on destruction. Keep the returned handle alive.
@@ -99,9 +102,11 @@ template<class Callback> struct lambda_callback {
 template<class Address, class Function>
 inline InlineHook create_inline(Address address, Function replacement, Options options = {}) {
     psp::Hook hook;
-    auto site = injector::detail::address(address);
+    auto site = injector::detail::noted(address);
+    auto entry = options.preserve_game_callees ? injector::detail::callback_address(replacement)
+                                             : injector::detail::address(replacement);
     auto status = injector::detail::fits(site)
-        ? hook.create_inline(injector::detail::backend, static_cast<uint32_t>(site), replacement, options.instructions)
+        ? hook.create_inline(injector::detail::backend, static_cast<uint32_t>(site), static_cast<uint32_t>(entry), options.instructions)
         : PSP_HOOK_OUT_OF_RANGE;
     return detail::finish(std::move(hook), status);
 }
@@ -111,14 +116,14 @@ inline MidHook create_mid(Address address, Callback callback, Options options = 
     static_assert(std::is_empty_v<Callback> && std::is_convertible_v<Callback, void (*)(Context&)>,
         "use a noncapturing lambda taking SafetyMipsContext&; named functions use create_mid<&function>()");
     psp::Hook hook;
-    auto site = injector::detail::address(address);
+    auto site = injector::detail::noted(address);
     auto entry = reinterpret_cast<uintptr_t>(&detail::lambda_callback<Callback>::invoke);
     auto status = PSP_HOOK_OUT_OF_RANGE;
     if (options.preserve & PSP_HOOK_RAW_CALLBACK) status = PSP_HOOK_INVALID_ARGUMENT;
     else if (injector::detail::fits(site) && injector::detail::fits(entry)) {
         new (detail::lambda_callback<Callback>::storage) Callback(callback);
         status = hook.create_mid(injector::detail::backend, static_cast<uint32_t>(site),
-            static_cast<uint32_t>(entry), 0, options.module_gp, options.preserve | (options.execute_original ? 0u : PSP_HOOK_REPLACE_INSTRUCTIONS), options.instructions);
+            static_cast<uint32_t>(entry), 0, options.module_gp, options.preserve | (options.execute_original ? 0u : unsigned(PSP_HOOK_REPLACE_INSTRUCTIONS)), options.instructions);
     }
     return detail::finish(std::move(hook), status);
 }
@@ -126,10 +131,10 @@ inline MidHook create_mid(Address address, Callback callback, Options options = 
 template<auto Callback, class Address>
 inline MidHook create_mid(Address address, void* user = nullptr, Options options = {}) {
     psp::Hook hook;
-    auto site = injector::detail::address(address);
+    auto site = injector::detail::noted(address);
     auto status = injector::detail::fits(site)
         ? hook.template create_mid<Callback>(injector::detail::backend, static_cast<uint32_t>(site),
-            user, options.module_gp, options.preserve | (options.execute_original ? 0u : PSP_HOOK_REPLACE_INSTRUCTIONS), options.instructions)
+            user, options.module_gp, options.preserve | (options.execute_original ? 0u : unsigned(PSP_HOOK_REPLACE_INSTRUCTIONS)), options.instructions)
         : PSP_HOOK_OUT_OF_RANGE;
     return detail::finish(std::move(hook), status);
 }
@@ -146,7 +151,7 @@ inline safetymips::Status MakeInline(Address address, End end) {
     static_assert(std::is_empty_v<Functor> && std::is_default_constructible_v<Functor>,
                   "MakeInline requires a stateless default-constructible functor");
     static_assert(std::is_invocable_r_v<void, Functor, reg_pack&>, "functor accepts injector::reg_pack&");
-    auto begin = detail::address(address), limit = detail::address(end);
+    auto begin = detail::noted(address), limit = detail::address(end);
     if (!detail::fits(begin) || !detail::fits(limit) || limit <= begin || ((limit - begin) & 3))
         return detail::record(PSP_HOOK_INVALID_ARGUMENT);
     safetymips::Options options{};
@@ -158,7 +163,7 @@ inline safetymips::Status MakeInline(Address address, End end) {
     return status;
 }
 template<class Functor, class Address> inline safetymips::Status MakeInline(Address address) {
-    auto site = detail::address(address);
+    auto site = detail::noted(address);
     return MakeInline<Functor>(site, site + 8);
 }
 }
@@ -203,7 +208,7 @@ template<class Functor, class Address, class End>
 inline safetymips::Status MakeInlineOnce(Address address, End end) {
     static_assert(std::is_empty_v<Functor> && std::is_default_constructible_v<Functor> &&
                   std::is_invocable_r_v<void, Functor, reg_pack&>, "use a stateless reg_pack functor");
-    auto begin = detail::address(address), limit = detail::address(end);
+    auto begin = detail::noted(address), limit = detail::address(end);
     auto callback = reinterpret_cast<uintptr_t>(&detail::once_callback<Functor>);
     if (!detail::fits(begin) || !detail::fits(limit) || !detail::fits(callback))
         return detail::record(PSP_HOOK_OUT_OF_RANGE);
@@ -243,7 +248,7 @@ inline safetymips::Status MakeInlineOnce(Address address, End end) {
     return detail::record(PSP_HOOK_OK);
 }
 template<class Functor, class Address> inline safetymips::Status MakeInlineOnce(Address address) {
-    auto site = detail::address(address);
+    auto site = detail::noted(address);
     return MakeInlineOnce<Functor>(site, site + 8);
 }
 }

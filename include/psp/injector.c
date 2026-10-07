@@ -265,7 +265,7 @@ static uintptr_t MakeInlineImpl(size_t instrCount, uintptr_t at, int discardDela
         if (psp_hook_control(original[2]) != 0) {
             RecordPatchStatus(PSP_HOOK_DELAY_SLOT); return 0;
         }
-        count = 3; tail = 8; /* A far conditional branch needs six words plus return. */
+        count = 3; tail = 10; /* A far linking branch needs eight words plus return. */
     }
     functor = MakeCallStub(instrCount + tail);
     if (!functor) { RecordPatchStatus(PSP_HOOK_ALLOCATION_FAILED); return 0; }

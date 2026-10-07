@@ -8,8 +8,42 @@
 #include "patches.h"
 #include "memory.h"
 #include "startup.hpp"
+#include "game_abi.hpp"
 #include <utility>
 #include <type_traits>
+
+#if defined(__GNUC__) && !defined(NDEBUG)
+#define INJECTOR_LOG_FAILURES 1
+extern "C" {
+#include "log.h"
+// Weak: a module that does not link log.c simply skips the diagnostic.
+extern struct logger_t logger __attribute__((weak));
+}
+#endif
+
+namespace injector {
+// The first failed operation since Initialize/SetBackend: the game site being
+// patched or hooked (0 when unknown) and the reason.
+struct HookFailure { uint32_t address; psp_hook_status status; };
+inline const char* StatusName(psp_hook_status status) {
+    switch (status) {
+    case PSP_HOOK_OK: return "ok";
+    case PSP_HOOK_INVALID_ARGUMENT: return "invalid argument";
+    case PSP_HOOK_UNALIGNED: return "unaligned address";
+    case PSP_HOOK_DELAY_SLOT: return "site or window splits a delay slot";
+    case PSP_HOOK_UNSUPPORTED_INSTRUCTION: return "window holds a non-relocatable instruction";
+    case PSP_HOOK_OUT_OF_RANGE: return "address or jump target out of range";
+    case PSP_HOOK_BUFFER_TOO_SMALL: return "buffer too small";
+    case PSP_HOOK_ALLOCATION_FAILED: return "allocation failed";
+    case PSP_HOOK_READ_FAILED: return "read failed";
+    case PSP_HOOK_WRITE_FAILED: return "write failed";
+    case PSP_HOOK_CONFLICT: return "conflicting patch or unexpected original code";
+    case PSP_HOOK_INVALID_STATE: return "invalid state";
+    case PSP_HOOK_BACKEND_UNAVAILABLE: return "backend unavailable";
+    }
+    return "unknown";
+}
+}
 
 // Configure once at module startup. The backend's user and storage must remain
 // alive for the session. These trivial globals need no CRT initialization.
@@ -57,9 +91,21 @@ template<class T> inline runtime_scalar<T>* scalar_access() {
 inline batch_state* batch = nullptr;
 inline void (*error_handler)(psp_hook_status) = nullptr;
 inline psp_hook_status last_status = PSP_HOOK_BACKEND_UNAVAILABLE;
+inline uint32_t current_site = 0;
+inline HookFailure first_failure{0, PSP_HOOK_OK};
+inline void note_site(uintptr_t value) { current_site = value <= UINT32_MAX ? static_cast<uint32_t>(value) : 0; }
+inline void note_failure(psp_hook_status status) {
+    if (status == PSP_HOOK_OK || first_failure.status != PSP_HOOK_OK) return;
+    first_failure = {current_site, status};
+#ifdef INJECTOR_LOG_FAILURES
+    if (&logger && logger.WriteF)
+        logger.WriteF("injector: %s (%u) at %08X\n", StatusName(status), unsigned(status), unsigned(current_site));
+#endif
+}
 inline psp_hook_status record(psp_hook_status status) {
     auto previous = last_status;
     last_status = status;
+    note_failure(status);
     if (batch && batch->status == PSP_HOOK_OK) batch->status = status;
     if (startup.active && status != PSP_HOOK_OK && startup.error == PSP_HOOK_OK) startup.error = status;
     if (!startup.active && status != PSP_HOOK_OK && status != previous && error_handler) error_handler(status);
@@ -69,12 +115,28 @@ template<class T> uintptr_t address(T value) {
     if constexpr (std::is_pointer_v<T>) return reinterpret_cast<uintptr_t>(value);
     else return static_cast<uintptr_t>(value);
 }
+// Resolves a patched/hooked game site and remembers it for failure reports.
+template<class T> uintptr_t noted(T value) { auto result = address(value); note_site(result); return result; }
 inline bool fits(uintptr_t value) { return value <= UINT32_MAX; }
+inline psp::GameCallbacks game_callbacks;
+template<class T> uintptr_t callback_address(T target) {
+    const uintptr_t value=address(target);
+#ifdef PSP_GAME_ABI_COMPAT
+    if constexpr (std::is_pointer_v<T> && std::is_function_v<std::remove_pointer_t<T>>) {
+        if (!fits(value)) { record(PSP_HOOK_OUT_OF_RANGE);return 0; }
+        uint32_t entry=0;
+        record(game_callbacks.bind(backend,target,entry));
+        return entry;
+    }
+#endif
+    return value;
+}
 }
 
 inline psp_hook_status SetBackend(const psp_hook_backend& backend,
     void (*on_error)(psp_hook_status) = nullptr) {
     detail::error_handler = on_error;
+    detail::first_failure = {0, PSP_HOOK_OK}; detail::current_site = 0;
     if (detail::batch || detail::startup.active) return detail::record(PSP_HOOK_INVALID_STATE);
     if (!backend.read || !backend.write || !backend.flush)
         return detail::record(PSP_HOOK_BACKEND_UNAVAILABLE);
@@ -88,16 +150,23 @@ inline psp_hook_status Initialize(const psp_hook_backend& backend,
     if (status != PSP_HOOK_OK) return status;
     if (!backend.allocate || !backend.release) return detail::record(PSP_HOOK_BACKEND_UNAVAILABLE);
     ++detail::startup.generation;
-    detail::startup.next_id = 0; detail::startup.error = PSP_HOOK_OK;
+    detail::startup.next_id = 0; detail::startup.error = PSP_HOOK_OK; detail::startup.failed_address = 0;
     detail::startup.active = true;
     return PSP_HOOK_OK;
 }
 inline psp_hook_status FlushCaches() {
     if (!detail::startup.active) return detail::last_status;
-    return detail::record(detail::finish_startup());
+    auto status = detail::finish_startup();
+    if (detail::startup.failed_address) detail::note_site(detail::startup.failed_address);
+    // Startup suppressed the handler for queued failures, and the same status may
+    // already be the last one recorded. Report the rejected session exactly once.
+    detail::last_status = PSP_HOOK_OK;
+    return detail::record(status);
 }
 
 inline psp_hook_status LastError() { return detail::last_status; }
+// First failure (site and reason) since the last Initialize/SetBackend.
+inline HookFailure FirstFailure() { return detail::first_failure; }
 
 class memory_pointer {
     uintptr_t value_ = 0;
@@ -183,7 +252,7 @@ public:
 
 template<class Address, class Target>
 inline memory_pointer MakeCALL(Address address, Target target, bool = true) {
-    auto site = detail::address(address), destination = detail::address(target);
+    auto site = detail::noted(address), destination = detail::callback_address(target);
     if (!detail::fits(site) || !detail::fits(destination)) {
         detail::record(PSP_HOOK_OUT_OF_RANGE); return {};
     }
@@ -249,9 +318,16 @@ template<class Create> inline memory_pointer publish(Create create) {
     return status == PSP_HOOK_OK ? memory_pointer(previous) : memory_pointer{};
 }
 template<class Address> bool site(Address address, uint32_t& result) {
-    auto value = detail::address(address);
+    auto value = detail::noted(address);
     if (!fits(value)) { record(PSP_HOOK_OUT_OF_RANGE); return false; }
     result = static_cast<uint32_t>(value); return true;
+}
+// Destination operands do not replace the remembered site.
+template<class Target> bool target_site(Target target, uint32_t& result) {
+    auto previous = current_site;
+    auto ok = site(target, result);
+    current_site = previous;
+    return ok;
 }
 }
 
@@ -343,13 +419,13 @@ template<class Address> inline memory_pointer GetBranchDestination(Address addre
     }
     auto status = psp_memory_read(&detail::backend, site, &word, 4);
     if (status == PSP_HOOK_OK && psp_hook_op(word) != 2 && psp_hook_op(word) != 3 &&
-        psp_hook_control(word) != 1) status = PSP_HOOK_UNSUPPORTED_INSTRUCTION;
+        psp_hook_control(word) != 1 && psp_hook_control(word) != 6) status = PSP_HOOK_UNSUPPORTED_INSTRUCTION;
     detail::record(status);
     return status == PSP_HOOK_OK ? memory_pointer(psp_hook_target(site, word)) : memory_pointer{};
 }
 template<class Address, class Target> inline memory_pointer MakeJMP(Address address, Target target, bool = true) {
     uint32_t site, destination;
-    if (!detail::site(address, site) || !detail::site(target, destination)) return {};
+    if (!detail::site(address, site) || !detail::target_site(detail::callback_address(target), destination)) return {};
     if (detail::runtime.jump && !detail::startup.active && !detail::batch) {
         auto original = detail::runtime.jump(site, destination);
         detail::record(detail::runtime.status());
@@ -375,7 +451,7 @@ template<class Address> inline psp_hook_status MakeNOP(Address address, size_t b
     return LastError();
 }
 template<class Address, class End> inline psp_hook_status MakeRangedNOP(Address address, End end, bool vp = true) {
-    auto begin = detail::address(address), limit = detail::address(end);
+    auto begin = detail::noted(address), limit = detail::address(end);
     if (limit <= begin || !detail::fits(begin) || !detail::fits(limit)) return detail::record(PSP_HOOK_INVALID_ARGUMENT);
     return MakeNOP(begin, limit - begin, vp);
 }
@@ -390,7 +466,7 @@ template<class Address> inline psp_hook_status MakeRET(Address address, uint16_t
 }
 template<class Address, class Target> inline psp_hook_status SetBranchDestination(Address address, Target target) {
     uint32_t site, destination;
-    if (!detail::site(address, site) || !detail::site(target, destination)) return LastError();
+    if (!detail::site(address, site) || !detail::target_site(target, destination)) return LastError();
     detail::publish([&](psp_patch* patch) {
         return psp_patch_create_branch(patch, &detail::backend, site, destination);
     });
@@ -443,7 +519,7 @@ public:
     template<class Address, class Target> scoped_call(Address address, Target target, bool vp = true) { make_call(address, target, vp); }
     template<class Address, class Target> memory_pointer make_call(Address address, Target target, bool = true) {
         uint32_t site, destination;
-        if (!detail::site(address, site) || !detail::site(target, destination)) { status_ = LastError(); return {}; }
+        if (!detail::site(address, site) || !detail::target_site(detail::callback_address(target), destination)) { status_ = LastError(); return {}; }
         return install([&](psp_patch* patch) { return psp_patch_create_call(patch, &detail::backend, site, destination); });
     }
 };
@@ -453,7 +529,7 @@ public:
     template<class Address, class Target> scoped_jmp(Address address, Target target, bool vp = true) { make_jmp(address, target, vp); }
     template<class Address, class Target> memory_pointer make_jmp(Address address, Target target, bool = true) {
         uint32_t site, destination;
-        if (!detail::site(address, site) || !detail::site(target, destination)) { status_ = LastError(); return {}; }
+        if (!detail::site(address, site) || !detail::target_site(detail::callback_address(target), destination)) { status_ = LastError(); return {}; }
         return install([&](psp_patch* patch) { return psp_patch_create_jump(patch, &detail::backend, site, destination); });
     }
 };

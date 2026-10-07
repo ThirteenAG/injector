@@ -23,6 +23,7 @@ struct startup_state {
     startup_entry *first, *last;
     uint32_t generation, next_id;
     pcsx2_hook_status error;
+    uint32_t failed_address; /* Site whose validation/publication failed. */
     bool active;
 };
 inline startup_state startup{};
@@ -176,7 +177,10 @@ inline pcsx2_hook_status finish_startup() {
             if (entry->kind == entry_kind::cancelled) continue;
             status = entry->kind == entry_kind::patch ? pcsx2_patch_enable(&entry->value.patch)
                                                       : pcsx2_hook_enable(entry->owner);
-            if (status != PCSX2_HOOK_OK) break;
+            if (status != PCSX2_HOOK_OK) {
+                startup.failed_address = entry->kind == entry_kind::patch ? entry->value.patch.address : entry->owner->address;
+                break;
+            }
             last_published = entry;
         }
     }

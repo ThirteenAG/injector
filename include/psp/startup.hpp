@@ -23,6 +23,7 @@ struct startup_state {
     startup_entry *first, *last;
     uint32_t generation, next_id;
     psp_hook_status error;
+    uint32_t failed_address; /* Site whose validation/publication failed. */
     bool active;
 };
 inline startup_state startup{};
@@ -176,7 +177,10 @@ inline psp_hook_status finish_startup() {
             if (entry->kind == entry_kind::cancelled) continue;
             status = entry->kind == entry_kind::patch ? psp_patch_enable(&entry->value.patch)
                                                       : psp_hook_enable(entry->owner);
-            if (status != PSP_HOOK_OK) break;
+            if (status != PSP_HOOK_OK) {
+                startup.failed_address = entry->kind == entry_kind::patch ? entry->value.patch.address : entry->owner->address;
+                break;
+            }
             last_published = entry;
         }
     }

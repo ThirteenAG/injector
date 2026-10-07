@@ -45,9 +45,26 @@ budgets from maximum configured array sizes and measured peak use, allowing for
 metadata and fragmentation. Runtime-dependent demand cannot generally be
 computed completely at compilation time.
 
-LCS Project2DFX reserves 128 KiB: its maximum 1,024 corona records need 114,688
-payload bytes, leaving space for metadata and existing trampolines. Failure to
-allocate the array retains the game's original corona pool.
+WFP's rewritten LCS Project2DFX embeds the maximum 1,024 corona records directly
+in its module image and reserves 32 KiB separately for hooks. The two reservations
+cannot consume each other's storage.
+
+## Calls between game and SDK code
+
+Native-game compilers can preserve even f20..f30 while PSP SDK EABI preserves
+f20..f27. Add `PSP_GAME_ABI_COMPAT` to the JSON manifest when using native-game
+callbacks. The SDK builder makes f21/f23/f25/f27 caller-saved and reserves f28/f30,
+so direct typed calls into either convention do not lose compiler temporaries.
+The C++ injector frontend then adapts typed call/jump/inline callbacks behind
+the usual API, preserving f20..f31, GP and FCSR, and forwarding overflow stack
+arguments. Its bounded per-module cache creates each adapter once; the running
+callback performs no lookup or allocation. Raw integer-address stubs keep their
+explicit ABI contract. The standalone C emitter is in `game_abi.h`.
+
+An integer-only inline callback needing the native return address can set
+`Options::preserve_game_callees=false`. It must not call floating-point SDK
+routines or modify native callee registers. An adapted callback's return address
+belongs to its adapter; do not use it to identify the game's caller.
 
 ## Backend and lifetime
 
@@ -117,8 +134,10 @@ sets a nonzero supplied module GP; zero retains the incoming game GP. It saves
 GPRs, HI and LO. Optional flags preserve
 FPRs/FCR31 and VFPU registers/control state. Excluded fields are unspecified.
 The wrapper consumes 880 stack bytes in addition to callback and callee frames.
-VFPU instructions match the actual Allegrex assembler. Saved pending prefixes
-are reset before calling the callback and restored afterward.
+VFPU instructions match the actual Allegrex assembler. The prefix registers
+(VPFXS/VPFXT/VPFXD) are saved into the context but never written: a hook site never
+splits a prefix from its consumer, and writing them before non-VFPU code leaves an
+"uneaten" prefix that makes PPSSPP disable JIT optimisations for the session.
 
 `PSP_HOOK_RAW_CALLBACK` retains incoming register arguments instead of passing a
 context and user pointer. Stack arguments are not copied into the callback frame.
@@ -130,12 +149,20 @@ saves and restores 128 vector registers per invocation. No generated callback al
 Inline replacements use the game's calling convention. Avoid GP-relative small
 data/PIC or provide an entry thunk. Capture starts outside a delay slot, covers
 at least two instructions and includes a final branch's delay slot. The
-relocator supports conditional and likely branches, J and JR, including internal
-targets. It rejects link instructions, traps and privileged operations. J
-targets must fit the same 256 MiB jump region. A preparation failure leaves the
-game patch untouched.
+relocator supports conditional and likely branches (including VFPU branches),
+J, JR, JAL, JALR and the linking REGIMM branches, including internal targets. A
+call pair that ends the window loads the original return address (the window
+end) and jumps, so the callee returns directly to game code with the exact
+original link value. A call earlier in the window links into the trampoline,
+which runs the rest of the window; the callee then observes a trampoline return
+address, and the hook's code must stay alive while that callee can return.
+JALR with rd == rs, linking branches testing ra, syscalls, breaks, traps and
+privileged operations are rejected. J/JAL targets must fit the same 256 MiB jump
+region. A preparation failure leaves the game patch untouched.
 
 ## C++ plugin API
+
+Failure reporting: in a checked startup (`Initialize`/`InitializeCheckedRuntime`) any failure rejects the whole session at `FlushCaches`, which then calls the `on_error` handler exactly once. `injector::FirstFailure()` returns the first failing game site and status since the last initialization and `injector::StatusName(status)` names the reason, so a plugin can show e.g. "disabled: window holds a non-relocatable instruction at 004A1CC0". In Debug (`NDEBUG` undefined) builds the first failure is also written to `logger` when the module links `log.c` (weak reference; otherwise skipped).
 
 Include `injector.hpp` or `safetymips.hpp` for the Windows-style frontend. Both
 expose the same API; include only one platform's frontend in a translation unit.

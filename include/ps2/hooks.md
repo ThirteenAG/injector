@@ -103,10 +103,17 @@ a trampoline while a callback or an original-function call is executing it.
 
 Hooks overwrite at least two instructions. Capture includes the delay slot of a
 final branch. Relocation supports ordinary instructions, conditional branches
-(including likely branches), J and JR. Internal targets are remapped; far
-conditional branches preserve delay-slot execution and annulment. JAL, JALR,
-link branches, traps and privileged operations are rejected. J targets must be
-in the same 256 MiB jump region. Failures occur before installing the hook.
+(including likely branches), J, JR, JAL, JALR and the linking REGIMM branches
+(BLTZAL/BGEZAL and their likely forms). Internal targets are remapped; far
+conditional branches preserve delay-slot execution and annulment. A call pair
+that ends the window loads the original return address (the window end) and
+jumps, so the callee returns directly to game code with the exact original link
+value. A call earlier in the window links into the trampoline, which runs the
+rest of the window and jumps back; the callee then observes a trampoline return
+address, and the hook's code must not be destroyed while that callee can still
+return. JALR with rd == rs and linking branches testing ra are rejected, as are
+syscalls, breaks, traps and privileged operations. J/JAL targets must be in the
+same 256 MiB jump region as the trampoline. Failures occur before installing the hook.
 
 Mid callbacks run before relocated instructions, with arguments
 `pcsx2_hook_context*` and `void*`. A nonzero module GP selects that GP; zero retains
@@ -140,6 +147,8 @@ compile without GP-relative small data or PIC (`-G0 -fno-pic -mno-abicalls`), or
 provide an appropriate entry thunk.
 
 ## C++ plugin API
+
+Failure reporting: in a checked startup (`Initialize`/`InitializeCheckedRuntime`) any failure rejects the whole session at `FlushCaches`, which then calls the `on_error` handler exactly once. `injector::FirstFailure()` returns the first failing game site and status since the last initialization and `injector::StatusName(status)` names the reason, so a plugin can show e.g. "disabled: window holds a non-relocatable instruction at 004A1CC0". In `DEBUG`, `_DEBUG` or `WFP_PS2_DEBUG` builds the first failure is also written to `logger` when the module links `log.c` (weak reference; otherwise skipped).
 
 Include `injector.hpp` or `safetymips.hpp` for the Windows-style frontend. Both
 expose the same API; include only one platform's frontend in a translation unit.

@@ -57,6 +57,14 @@ inline pcsx2_hook_status InitializeRuntime(void (*on_error)(pcsx2_hook_status) =
     return PCSX2_HOOK_OK;
 }
 
+inline pcsx2_hook_status InitializeCheckedRuntime(void (*on_error)(pcsx2_hook_status) = nullptr)
+{
+    auto status = InitializeRuntime(on_error);
+    if (status != PCSX2_HOOK_OK) return status;
+    auto backend = detail::backend;
+    return Initialize(backend, on_error);
+}
+
 template<class T> inline uint32_t WordBits(T value)
 {
     if constexpr (std::is_same_v<T, float>) {
@@ -71,35 +79,35 @@ template<class T> inline uint16_t LowWord(T value) { return static_cast<uint16_t
 template<class Address, class... Words> inline memory_pointer MakeInline(Address address, Words... words)
 {
     static_assert(sizeof...(Words) > 0, "provide replacement instructions");
-    auto result = detail::injector.MakeInline(sizeof...(Words), detail::address(address), static_cast<uint32_t>(words)...);
+    auto result = detail::injector.MakeInline(sizeof...(Words), detail::noted(address), static_cast<uint32_t>(words)...);
     detail::record(detail::pcsx2_injector_last_patch_status());
     return memory_pointer(result);
 }
 template<class Address, class... Words> inline memory_pointer MakeInlineWithNOP(Address address, Words... words)
 {
     static_assert(sizeof...(Words) > 0, "provide replacement instructions");
-    auto result = detail::MakeInlineWithNOP(sizeof...(Words), detail::address(address), static_cast<uint32_t>(words)...);
+    auto result = detail::MakeInlineWithNOP(sizeof...(Words), detail::noted(address), static_cast<uint32_t>(words)...);
     detail::record(detail::pcsx2_injector_last_patch_status());
     return memory_pointer(result);
 }
 template<class Address> inline pcsx2_hook_status WriteInstr(Address address, uint32_t word)
 {
-    detail::injector.WriteInstr(detail::address(address), word);
+    detail::injector.WriteInstr(detail::noted(address), word);
     return detail::record(detail::pcsx2_injector_last_patch_status());
 }
 template<class Address> inline pcsx2_hook_status MakeInlineLUIORI(Address address, float value)
 {
-    detail::injector.MakeInlineLUIORI(detail::address(address), value);
+    detail::injector.MakeInlineLUIORI(detail::noted(address), value);
     return detail::record(detail::pcsx2_injector_last_patch_status());
 }
 template<class Address> inline pcsx2_hook_status MakeInlineLI(Address address, int32_t value)
 {
-    detail::injector.MakeInlineLI(detail::address(address), value);
+    detail::injector.MakeInlineLI(detail::noted(address), value);
     return detail::record(detail::pcsx2_injector_last_patch_status());
 }
 template<class Address, class Target> inline memory_pointer MakeTrampoline(Address address, Target target)
 {
-    auto result = detail::injector.MakeTrampoline(detail::address(address), detail::address(target));
+    auto result = detail::injector.MakeTrampoline(detail::noted(address), detail::address(target));
     detail::record(detail::pcsx2_injector_last_patch_status());
     return memory_pointer(result);
 }
@@ -110,7 +118,7 @@ __attribute__((always_inline))
 inline void* GetGP() { return detail::injector.GetGP(); }
 template<class Address> inline pcsx2_hook_status MakeLUIORI(Address address, mips_asm::RegisterID reg, float value)
 {
-    detail::injector.MakeLUIORI(detail::address(address), reg, value);
+    detail::injector.MakeLUIORI(detail::noted(address), reg, value);
     return detail::record(detail::pcsx2_injector_last_patch_status());
 }
 }
