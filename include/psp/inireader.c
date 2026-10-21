@@ -37,8 +37,9 @@ void SetIniPath(const char* szFileName)
 {
     inireader.iniName = szFileName;
 
-    static char buf[2000];
-    inireader.iniBufSize = sizeof(buf);
+    static char buf[8192];
+    buf[0] = 0;
+    inireader.iniBufSize = 0;
     inireader.iniBuf = buf;
 
     SceUID fileId = sceIoOpen(inireader.iniName, PSP_O_RDONLY, 0777);
@@ -46,8 +47,13 @@ void SetIniPath(const char* szFileName)
     {
         return;
     }
-    sceIoRead(fileId, buf, inireader.iniBufSize);
+    const int size = sceIoRead(fileId, buf, sizeof(buf) - 1);
     sceIoClose(fileId);
+    if (size > 0)
+    {
+        buf[size] = 0;
+        inireader.iniBufSize = size;
+    }
 }
 
 int ReadInteger(const char* szSection, const char* szKey, int iDefaultValue)
