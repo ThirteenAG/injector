@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <ctype.h>
+#include <string.h>
 
 typedef enum {
     STR2INT_SUCCESS,
@@ -83,17 +84,44 @@ float ReadFloat(const char* szSection, const char* szKey, float fltDefaultValue)
     }
 }
 
+// "Key = 1" as well as "Key=1": the value is trimmed first. 1/true/yes/on and 0/false/no/off, any case; anything else
+// is the default
 bool ReadBoolean(const char* szSection, const char* szKey, bool bDefaultValue)
 {
-    bool result = bDefaultValue;
-    if (rini_get_key(szSection, szKey, inireader.iniBuf, inireader.iniBufSize, &result, sizeof(result), BOOL_VAL))
-    {
-        return result;
-    }
-    else
-    {
+    char Buffer[16];
+    if (!rini_get_key(szSection, szKey, inireader.iniBuf, inireader.iniBufSize, Buffer, sizeof(Buffer), STRING_VAL))
         return bDefaultValue;
+
+    const char* value = Buffer;
+    while (*value == ' ' || *value == '\t')
+        ++value;
+    char word[8];
+    int length = 0;
+    while (value[length] && value[length] != ' ' && value[length] != '\t' && value[length] != '\r' && value[length] != '\n')
+    {
+        if (length == sizeof(word) - 1)
+            return bDefaultValue;
+        char c = value[length];
+        word[length++] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
     }
+    word[length] = '\0';
+    // One word only: anything but spaces after it ("1 0") is not a boolean
+    for (const char* rest = value + length; *rest; ++rest)
+    {
+        if (*rest != ' ' && *rest != '\t' && *rest != '\r' && *rest != '\n')
+            return bDefaultValue;
+    }
+
+    static const char* const yes[] = { "1", "true", "yes", "on" };
+    static const char* const no[] = { "0", "false", "no", "off" };
+    for (int i = 0; i < 4; ++i)
+    {
+        if (strcmp(word, yes[i]) == 0)
+            return true;
+        if (strcmp(word, no[i]) == 0)
+            return false;
+    }
+    return bDefaultValue;
 }
 
 const char* ReadString(const char* szSection, const char* szKey, const char* szDefaultValue, char* Buffer, int BufferSize)
