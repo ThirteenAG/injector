@@ -598,8 +598,8 @@ inline void MakeRangedNOP(memory_pointer_tr at, memory_pointer_tr until, bool vp
  */
 inline void MakeRET(memory_pointer_tr at, uint16_t pop = 0, bool vp = true)
 {
-    WriteMemory(at, pop? 0xC2 : 0xC3, vp);
-    if(pop) WriteMemory(at+1, pop, vp);
+    WriteMemory<uint8_t>(at, static_cast<uint8_t>(pop ? 0xC2 : 0xC3), vp);
+    if(pop) WriteMemory<uint16_t>(at+1, pop, vp);
 }
 
 
