@@ -6,14 +6,19 @@
  * This callback boundary preserves their union. Integer/float arguments already
  * use independent compact register banks; only overflow stack words are copied.
  * The guest build must treat f21/f23/f25/f27 as caller-saved and reserve f28/f30
- * so a direct call into either ABI cannot invalidate a live compiler temporary. */
+ * so a direct call into either ABI cannot invalidate a live compiler temporary.
+ * A nonzero module_gp runs the callback with that GP (the C library addresses its
+ * data through it); the caller's GP goes to game_gp_slot for calls back into the
+ * game, and the register gets it back on return. */
 static inline size_t psp_game_callback_words(unsigned stack_words)
-{ return stack_words<=64 ? 40u+2u*stack_words : 0; }
+{ return stack_words<=64 ? 44u+2u*stack_words : 0; }
 static inline psp_hook_status psp_game_emit_callback(uint32_t* words,size_t capacity,
-    uint32_t address,uint32_t target,unsigned stack_words,size_t* written)
+    uint32_t address,uint32_t target,unsigned stack_words,uint32_t module_gp,
+    uint32_t game_gp_slot,size_t* written)
 {
     unsigned i,spill,frame;size_t count=0;
-    if (!words || !written || !address || !target || (address&3) || (target&3) || stack_words>64)
+    if (!words || !written || !address || !target || (address&3) || (target&3) || stack_words>64 ||
+        (module_gp && !game_gp_slot))
         return PSP_HOOK_INVALID_ARGUMENT;
     if (capacity<psp_game_callback_words(stack_words)) return PSP_HOOK_BUFFER_TOO_SMALL;
     if (!psp_hook_jump_fits(address,target)) return PSP_HOOK_OUT_OF_RANGE;
@@ -22,6 +27,11 @@ static inline psp_hook_status psp_game_emit_callback(uint32_t* words,size_t capa
     PSP_GAME_WORD(0x27BD0000u | ((0u-frame)&0xFFFFu));
     PSP_GAME_WORD(0xAFBF0000u | (spill+48u));
     PSP_GAME_WORD(0xAFBC0000u | (spill+52u));
+    if (module_gp) {
+        PSP_GAME_WORD(psp_hook_i(15,0,24,(int)((game_gp_slot+0x8000u)>>16)));
+        PSP_GAME_WORD(psp_hook_i(43,24,28,(int)(game_gp_slot&0xFFFFu)));
+        psp_hook_emit_li(words,&count,28,module_gp);
+    }
     PSP_GAME_WORD(0x4458F800u); /* cfc1 t8,fcsr */
     PSP_GAME_WORD(0xAFB80000u | (spill+56u));
     for (i=0;i<12;++i) PSP_GAME_WORD(0xE7A00000u | ((20u+i)<<16) | (spill+i*4u));

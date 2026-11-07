@@ -192,11 +192,27 @@ public:
 
 namespace detail { inline uintptr_t address(memory_pointer value) { return value.as_int(); } }
 
+// A function of the game: calling it switches to the game's GP for the duration.
+template<class Function> class game_function;
+template<class Return, class... Args> class game_function<Return (*)(Args...)> {
+public:
+    using pointer = Return (*)(Args...);
+    constexpr game_function() = default;
+    constexpr game_function(pointer function) : function_(function) {}
+    explicit game_function(uintptr_t address) : function_(reinterpret_cast<pointer>(address)) {}
+    game_function& operator=(pointer function) { function_ = function; return *this; }
+    constexpr operator pointer() const { return function_; }
+    Return operator()(Args... args) const { return psp::game_call(function_, std::forward<Args>(args)...); }
+private:
+    pointer function_ = nullptr;
+};
+template<class Signature> using game_fn = game_function<std::conditional_t<std::is_pointer_v<Signature>, Signature, Signature*>>;
+
 template<class Function> struct hook_back {
     using function_type = std::conditional_t<std::is_pointer_v<Function>, Function, Function*>;
     static_assert(std::is_function_v<std::remove_pointer_t<function_type>>, "hook_back requires a function signature");
-    function_type fun = nullptr;
-    explicit operator bool() const { return fun != nullptr; }
+    game_function<function_type> fun = nullptr;
+    explicit operator bool() const { return static_cast<function_type>(fun) != nullptr; }
     template<class... Args> decltype(auto) operator()(Args&&... args) const {
         return fun(std::forward<Args>(args)...);
     }
@@ -484,7 +500,7 @@ template<class Address> inline psp_hook_status WriteConstant(Address address, ui
 template<class Signature> struct cstd;
 template<class Return, class... Args> struct cstd<Return(Args...)> {
     template<class Address> static Return call(Address address, Args... args) {
-        return reinterpret_cast<Return (*)(Args...)>(detail::address(address))(std::forward<Args>(args)...);
+        return psp::game_call(reinterpret_cast<Return (*)(Args...)>(detail::address(address)), std::forward<Args>(args)...);
     }
 };
 

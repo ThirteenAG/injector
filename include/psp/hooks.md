@@ -61,6 +61,24 @@ arguments. Its bounded per-module cache creates each adapter once; the running
 callback performs no lookup or allocation. Raw integer-address stubs keep their
 explicit ABI contract. The standalone C emitter is in `game_abi.h`.
 
+Add `PSP_CALLBACK_MODULE_GP` as well, and callbacks run with the module's own GP, set
+by the adapter and by mid hooks (`Options::module_gp` defaults to it). newlib addresses
+its data through GP, so `strtof`, `snprintf` or `errno` would otherwise read through the
+game's. The saved context and the game code after the hook keep the game's GP.
+
+Game code needs its own GP back, so every call from a callback into the game has to
+switch: `hook_back::fun`, `Hook::call`, `cstd<>::call` and `game_fn<Signature>` do
+(`game_fn` is the function pointer type for game functions, also for virtual calls
+through game vtables). Calling a game address through a plain C++ function pointer
+does not, and runs the game with the wrong GP. Hand-written `jalr`s bracket the call
+with `psp::enter_game` and `psp::leave_game`. The GP to switch to is the one the game
+last entered the module with, so it is unknown until the first hook has run: a call
+from `module_start` or the plugin's own thread before that keeps the module's GP.
+
+A callback entered without an adapter (a raw integer-address stub, or
+`preserve_game_callees=false`) keeps the game's GP. It must not call the C library;
+the calls into the game above stay correct, as they see GP already is the game's.
+
 An integer-only inline callback needing the native return address can set
 `Options::preserve_game_callees=false`. It must not call floating-point SDK
 routines or modify native callee registers. An adapted callback's return address
@@ -130,7 +148,8 @@ executing it. These operations are not thread-safe.
 
 Mid callbacks run before relocated instructions, with arguments
 `psp_hook_context*` and `void*`; register edits are applied on return. The wrapper
-sets a nonzero supplied module GP; zero retains the incoming game GP. It saves
+sets a nonzero supplied module GP; zero retains the incoming game GP. The context
+always holds the game's GP, and that is what the game gets back. It saves
 GPRs, HI and LO. Optional flags preserve
 FPRs/FCR31 and VFPU registers/control state. Excluded fields are unspecified.
 The wrapper consumes 880 stack bytes in addition to callback and callee frames.
@@ -141,13 +160,12 @@ splits a prefix from its consumer, and writing them before non-VFPU code leaves 
 
 `PSP_HOOK_RAW_CALLBACK` retains incoming register arguments instead of passing a
 context and user pointer. Stack arguments are not copied into the callback frame.
-The legacy adapter uses this mode, retains game GP, and saves FPU/VFPU state. It
-returns the callable original trampoline and retains code for module lifetime.
+The legacy adapter uses this mode and saves FPU/VFPU state. It returns the callable
+original trampoline and retains code for module lifetime.
 Select only the state needed by a new callback and its callees: VFPU preservation
 saves and restores 128 vector registers per invocation. No generated callback allocates.
 
-Inline replacements use the game's calling convention. Avoid GP-relative small
-data/PIC or provide an entry thunk. Capture starts outside a delay slot, covers
+Inline replacements use the game's calling convention. Capture starts outside a delay slot, covers
 at least two instructions and includes a final branch's delay slot. The
 relocator supports conditional and likely branches (including VFPU branches),
 J, JR, JAL, JALR and the linking REGIMM branches, including internal targets. A
