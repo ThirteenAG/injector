@@ -64,10 +64,27 @@ int ReadInteger(const char* szSection, const char* szKey, int iDefaultValue)
     {
         return result;
     }
-    else
+    // A whole number written like a float ("1.0") reads as that number; a fraction doesn't
+    char Buffer[30];
+    if (!rini_get_key(szSection, szKey, inireader.iniBuf, inireader.iniBufSize, Buffer, sizeof(Buffer), STRING_VAL) ||
+        !strchr(Buffer, '.'))
     {
         return iDefaultValue;
     }
+    char* end = NULL;
+    const double value = strtod(Buffer, &end);
+    if (end == Buffer)
+    {
+        return iDefaultValue;
+    }
+    while (*end == ' ' || *end == '\t' || *end == '\r')
+        ++end;
+    // Like the plain form: no trailing text, no negative numbers
+    if (*end || !(value >= 0 && value <= 2147483647.0) || (double)(int)value != value)
+    {
+        return iDefaultValue;
+    }
+    return (int)value;
 }
 
 float ReadFloat(const char* szSection, const char* szKey, float fltDefaultValue)
