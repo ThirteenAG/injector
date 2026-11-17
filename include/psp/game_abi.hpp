@@ -1,6 +1,7 @@
 #ifndef INJECTOR_PSP_GAME_ABI_HPP
 #define INJECTOR_PSP_GAME_ABI_HPP
 #include "game_abi.h"
+#include "hooks.hpp"
 #include <type_traits>
 
 namespace psp {
@@ -41,7 +42,8 @@ struct GameCallbacks {
         psp_hook_buffer buffer{};
         if (!backend.allocate(backend.user,capacity*4,target,&buffer)) return PSP_HOOK_ALLOCATION_FAILED;
         size_t words=0;
-        auto status=psp_game_emit_callback(buffer.words,buffer.capacity/4,buffer.address,target,stack,&words);
+        auto status=psp_game_emit_callback(buffer.words,buffer.capacity/4,buffer.address,target,stack,
+            module_gp(),uint32_t(reinterpret_cast<uintptr_t>(&game_gp)),&words);
         if (status!=PSP_HOOK_OK) { backend.release(backend.user,&buffer);return status; }
         backend.flush(backend.user,buffer.address,words*4);
         entries[count++]={target,buffer.address,stack,buffer};

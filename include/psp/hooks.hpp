@@ -5,15 +5,58 @@
 #include <type_traits>
 #include <utility>
 
+#ifdef PSP_CALLBACK_MODULE_GP
+extern "C" char _gp[];
+#endif
+
 namespace psp {
 using HookContext = psp_hook_context;
 using HookBackend = psp_hook_backend;
 using HookStatus = psp_hook_status;
 
+// PSP_CALLBACK_MODULE_GP: callbacks run with the module's GP, as the C library addresses
+// its data through it. Game code needs its own, so every call into the game goes through
+// game_call.
+inline uint32_t game_gp = 0; // GP of the game code that entered the module last.
+#ifdef PSP_CALLBACK_MODULE_GP
+inline uint32_t module_gp() { return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(_gp)); }
+inline void note_game_gp(const psp_hook_context& context) { game_gp = context.gpr[28].word[0]; }
+[[gnu::noinline]] inline uint32_t enter_game() {
+    uint32_t current;
+    asm volatile("move %0, $gp" : "=r"(current));
+    // A callback entered without an adapter already has the game's GP.
+    if (current == module_gp() && game_gp) asm volatile("move $gp, %0" : : "r"(game_gp));
+    return current;
+}
+[[gnu::noinline]] inline void leave_game(uint32_t restore) {
+    // Code of another game module may have entered this one while the game ran.
+    if (restore == module_gp()) asm volatile("move %0, $gp" : "=r"(game_gp));
+    asm volatile("move $gp, %0" : : "r"(restore));
+}
+#else
+inline uint32_t module_gp() { return 0; }
+inline void note_game_gp(const psp_hook_context&) {}
+inline uint32_t enter_game() { return 0; }
+inline void leave_game(uint32_t) {}
+#endif
+template<class Return, class... Args, class... Values>
+inline Return game_call(Return (*function)(Args...), Values&&... values) {
+    const uint32_t restore = enter_game();
+    if constexpr (std::is_void_v<Return>) {
+        function(std::forward<Values>(values)...);
+        leave_game(restore);
+    } else {
+        Return result = function(std::forward<Values>(values)...);
+        leave_game(restore);
+        return result;
+    }
+}
+
 /* Compile-time callback selection: no heap storage or indirect C++ dispatch. */
 template<auto Callback>
 inline void mid_callback(psp_hook_context* context, void* user) {
     static_assert(Callback != nullptr, "mid callback must not be null");
+    note_game_gp(*context);
     Registers regs(*context);
     if constexpr (std::is_invocable_v<decltype(Callback), Registers&, void*>) {
         static_assert(std::is_same_v<decltype(Callback(regs, user)), void>, "mid callback must return void");

@@ -10,7 +10,7 @@ using Status = psp::HookStatus;
 struct Options {
     size_t instructions = 2;
     unsigned preserve = PSP_HOOK_SAVE_FPU | PSP_HOOK_SAVE_VFPU;
-    uint32_t module_gp = 0;
+    uint32_t module_gp = psp::module_gp();
     bool execute_original = true;
     // Integer-only callbacks that inspect the native return address can opt out.
     // They must not call floating-point SDK routines or clobber native f28/f30.
@@ -72,10 +72,13 @@ public:
         return error_ = psp_hook_destroy(&hook_);
     }
     template<class Function> Function original() const {
-        return reinterpret_cast<Function>(static_cast<uintptr_t>(hook_.trampoline));
+        if constexpr (std::is_pointer_v<Function>)
+            return reinterpret_cast<Function>(static_cast<uintptr_t>(hook_.trampoline));
+        else
+            return Function(static_cast<uintptr_t>(hook_.trampoline));
     }
     template<class Return = void, class... Args> Return call(Args... args) const {
-        return original<Return (*)(Args...)>()(args...);
+        return psp::game_call(original<Return (*)(Args...)>(), args...);
     }
 };
 using InlineHook = Hook;
@@ -93,6 +96,7 @@ inline Hook finish(psp::Hook&& hook, Status status) {
 template<class Callback> struct lambda_callback {
     alignas(Callback) inline static unsigned char storage[sizeof(Callback)]{};
     static void invoke(psp_hook_context* context, void*) {
+        psp::note_game_gp(*context);
         Context regs(*context);
         (*reinterpret_cast<Callback*>(storage))(regs);
     }
@@ -185,6 +189,7 @@ inline void destroy_once(void* user) {
     owner_backend.release(owner_backend.user, &storage);
 }
 template<class Functor> void once_callback(psp_hook_context* context, void* user) {
+    psp::note_game_gp(*context);
     auto state = static_cast<once_state*>(user);
     // Restore the original site before invoking user code. Recursive game calls
     // now execute the original instructions, and later frames pay no hook cost.
